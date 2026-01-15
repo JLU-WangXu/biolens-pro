@@ -4,8 +4,15 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/ngl/2.1.0/ngl.js"></script>
-    <title>BioLens Pro</title>
+    <!-- 核心变化：引入 Mol* 的样式和脚本 -->
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.css" />
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.js"></script>
+    <!-- 引入一些基础样式修正 -->
+    <style>
+        /* Mol* 需要绝对定位来铺满容器 */
+        .molstar-canvas { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+    </style>
+    <title>BioLens Pro (Mol* Engine)</title>
   </head>
   <body>
     <div id="root"></div>
