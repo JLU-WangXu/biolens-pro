@@ -1,3 +1,5 @@
+'use client';
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   Camera, Upload, Download, Search, Zap, Droplet, Box, 
@@ -7,13 +9,12 @@ import {
 } from 'lucide-react';
 
 /**
- * BioLens Agent Pro - V3.9 (Logic Priority & Regex Fix)
+ * BioLens Agent Pro - V4.0 (High Contrast & Logic Fix)
  * * Update Log:
- * 1. [Logic] Smart Priority System: Collects ALL tokens (Residue, Chain, Color) before acting.
- * - Fixes "Amino acid A chain 100" turning the whole chain red. Now correctly targets Residue 100 on Chain A.
- * 2. [Regex] Enhanced Chinese Support: Better parsing for "氨基酸A链100", "A链100号".
- * 3. [Visual] High Contrast Overlays: Binding pockets and H-bonds now use neon colors/thicker lines for visibility.
- * 4. [UX] Button Feedback: Targets panel buttons now trigger Toast notifications.
+ * 1. [Visual] Changed Chain Overlay to 'ball-and-stick' to fix "no visual response" issue (z-fighting).
+ * 2. [Logic] Rewrote Command Parser: Logic is now "Feature Detection" based, not strict Regex groups.
+ * 3. [Fix] Global H-Bond logic simplified to ensure "全局氢键" always triggers.
+ * 4. [UX] Added clear visual cues (Toast + Chat response) for every action.
  */
 
 // -----------------------------------------------------------------------------
@@ -21,6 +22,7 @@ import {
 // -----------------------------------------------------------------------------
 const loadMolstarResources = () => {
   return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined') { resolve(); return; }
     if (window.molstar) { resolve(); return; }
     const link = document.createElement('link');
     link.rel = 'stylesheet';
@@ -35,7 +37,6 @@ const loadMolstarResources = () => {
   });
 };
 
-// --- Style Definitions ---
 const STYLES = {
   cartoon: { label: 'Cartoon', type: 'cartoon', param: { alpha: 1 } },
   surface: { label: 'Surface', type: 'molecular-surface', param: { alpha: 0.9, quality: 'auto' } },
@@ -43,7 +44,6 @@ const STYLES = {
   spacefill: { label: 'Spacefill', type: 'spacefill', param: { } },
 };
 
-// --- Presets ---
 const JOURNAL_PRESETS = {
   default: { label: 'Standard', bgColor: 0xf8f9fa, style: 'cartoon', color: 'chain', lighting: 'flat' },
   nature: { label: 'Nature (Paper)', bgColor: 0xffffff, style: 'cartoon', color: 'chain', lighting: 'occlusion', param: { alpha: 1.0 } },
@@ -82,7 +82,7 @@ const BioLensApp = () => {
   // Interaction
   const [clickMode, setClickMode] = useState('pick'); 
   const [agentOverlays, setAgentOverlays] = useState([]); 
-  const [messages, setMessages] = useState([{ role: 'system', content: 'Agent Ready. 试着输入: "A链变蓝", "氨基酸A链100变红", "显示配体"' }]);
+  const [messages, setMessages] = useState([{ role: 'system', content: 'Agent Ready. 试着输入: "A链变蓝", "氨基酸A链100变红", "显示全局氢键"' }]);
   const [inputMsg, setInputMsg] = useState("");
 
   // Helpers
@@ -98,6 +98,7 @@ const BioLensApp = () => {
     const init = async () => {
       try {
         await loadMolstarResources();
+        if (!window.molstar) return;
         const viewer = await window.molstar.Viewer.create(containerRef.current, {
           layoutIsExpanded: false, layoutShowControls: false, layoutShowRemoteState: false,
           layoutShowSequence: true, viewportShowExpand: false, viewportShowSelectionMode: true,
@@ -107,6 +108,7 @@ const BioLensApp = () => {
         await handleFetchPdb('4HHB'); 
         setLoading(false);
       } catch (e) {
+        console.error(e);
         setError("Init Error: " + e.message);
         setLoading(false);
       }
@@ -158,10 +160,10 @@ const BioLensApp = () => {
                    if (newOverlay) {
                        setAgentOverlays(prev => [...prev, newOverlay]);
                        showToast(feedbackMsg);
-                       setMessages(prev => [...prev, { role: 'system', content: `[点击交互] ${feedbackMsg}` }]);
+                       setMessages(prev => [...prev, { role: 'system', content: `[点击] ${feedbackMsg}` }]);
                    }
                }
-            } catch (err) { console.warn("Click processing error:", err); }
+            } catch (err) { console.warn("Click error:", err); }
         }
     });
 
@@ -194,7 +196,7 @@ const BioLensApp = () => {
                 canvas.setProps({ renderer: rendererProps, postProcessing: postProps });
             }
 
-            // 2. Clean Base
+            // 2. Clean Base (Safe Delete)
             const currentComponents = structure.components;
             const componentsToDelete = [];
             for (const c of currentComponents) {
@@ -216,7 +218,7 @@ const BioLensApp = () => {
                 });
             }
 
-            // 4. Details
+            // 4. Standard Details
             if (showLigands) {
                 const ligandComp = await plugin.builders.structure.tryCreateComponentStatic(structure.cell, 'ligand');
                 if (ligandComp && state.cells.has(ligandComp.ref)) await plugin.builders.structure.representation.addRepresentation(ligandComp, { type: 'ball-and-stick', color: 'element-symbol' });
@@ -226,7 +228,7 @@ const BioLensApp = () => {
                 if (waterComp && state.cells.has(waterComp.ref)) await plugin.builders.structure.representation.addRepresentation(waterComp, { type: 'ball-and-stick', color: 'uniform', colorParams: { value: 0x88ccff }, typeParams: { alpha: 0.4 } });
             }
 
-            // 5. AGENT OVERLAYS
+            // 5. AGENT OVERLAYS (The Highlight System)
             const MS = window.molstar?.MolScriptBuilder;
             if (!MS) return;
 
@@ -250,6 +252,7 @@ const BioLensApp = () => {
                     const [start, end] = overlay.target.split('-').map(Number);
                     const endRes = end || start;
                     const resTest = MS.core.logic.and([ MS.core.rel.gr([MS.struct.atomProperty.macromolecular.auth_seq_id(), start - 1]), MS.core.rel.lt([MS.struct.atomProperty.macromolecular.auth_seq_id(), endRes + 1]) ]);
+                    // If targetChain is null, we don't constrain by chain (useful for "Residue 100 on ALL chains")
                     expression = MS.struct.generator.atomGroups({ 'residue-test': resTest, 'chain-test': chainTest || true });
                 }
                 else if (overlay.type === 'zone') {
@@ -269,15 +272,12 @@ const BioLensApp = () => {
                             await plugin.builders.structure.representation.addRepresentation(selComp, { type: 'ball-and-stick', color: 'element-symbol', typeParams: { sizeFactor: 0.15 } });
                         } else {
                             const colorVal = parseInt(overlay.color.replace('#', ''), 16);
+                            // VISUAL FIX: Use 'ball-and-stick' for chains to ensure they pop over cartoon
+                            const ovStyle = overlay.type === 'chain' ? 'ball-and-stick' : (overlay.style || 'ball-and-stick');
+                            
                             await plugin.builders.structure.representation.addRepresentation(selComp, {
-                                type: overlay.style || 'cartoon', color: 'uniform', colorParams: { value: colorVal }, typeParams: { sizeFactor: 0.22, quality: 'highest' } 
+                                type: ovStyle, color: 'uniform', colorParams: { value: colorVal }, typeParams: { sizeFactor: 0.25 } 
                             });
-                            // High Visibility for Zones
-                            if (overlay.type === 'zone' || overlay.type === 'ligand-surround') {
-                                await plugin.builders.structure.representation.addRepresentation(selComp, { 
-                                    type: 'ball-and-stick', color: 'uniform', colorParams: { value: colorVal }, typeParams: { sizeFactor: 0.3 } 
-                                });
-                            }
                         }
                     }
                 }
@@ -326,15 +326,15 @@ const BioLensApp = () => {
   };
 
   // ---------------------------------------------------------------------------
-  // Agent Logic (Smart Priority)
+  // Agent Logic (Rewritten for V4.0)
   // ---------------------------------------------------------------------------
   const processAgentCommand = async (cmd) => {
       const lowerCmd = cmd.toLowerCase();
       
-      // -- Extraction Phase --
+      // --- 1. Detect Intent Features ---
       
-      // 1. Color Extraction
-      let colorCode = '#ff0000'; // Default Red
+      // Color
+      let colorCode = '#ff0000'; // Default
       let hasColor = false;
       if (lowerCmd.match(/red|红/)) { colorCode = '#ff0000'; hasColor = true; }
       else if (lowerCmd.match(/blue|蓝/)) { colorCode = '#0000ff'; hasColor = true; }
@@ -343,85 +343,84 @@ const BioLensApp = () => {
       else if (lowerCmd.match(/purple|紫/)) { colorCode = '#800080'; hasColor = true; }
       else if (lowerCmd.match(/cyan|青/)) { colorCode = '#00ffff'; hasColor = true; }
 
-      // 2. Chain Extraction (Supported: "Chain A", "A链", "A chain")
+      // Chain ID (e.g., "A")
+      // Match "Chain A", "A链", or just "A" if context is right? No, keep it safe.
+      // "A链" -> match[1] = "A"
       const chainMatch = cmd.match(/(?:chain|链)\s*([a-zA-Z0-9])/i) || cmd.match(/([a-zA-Z0-9])\s*(?:chain|链)/i);
       const chainId = chainMatch ? chainMatch[1].toUpperCase() : null;
 
-      // 3. Residue Extraction (Supported: "Residue 100", "100号", "100-200", "氨基酸100")
-      // We look for digits that are possibly associated with residue keywords, OR just standalone if we have other context.
-      // A safe regex that catches "amino acid...100" or "100...residue" or just "100" if "amino acid" is present elsewhere.
-      let start = null; 
-      let end = null;
-      // Broad regex to catch numbers. We will only use them if we have 'residue' context or it looks like a range.
-      const numberMatch = lowerCmd.match(/(\d+)(?:-(\d+))?/); 
-      const hasResidueKeyword = lowerCmd.match(/(residue|res|残基|氨基酸|位点)/);
-      
-      if (numberMatch && (hasResidueKeyword || chainId)) { 
-          // If we have a number AND (a residue keyword OR a chain ID), we treat it as a residue target.
-          // This allows "A链100" (Chain A 100) to be parsed as Residue 100 on Chain A.
-          start = numberMatch[1];
-          end = numberMatch[2] || start;
-      }
+      // Residue ID (e.g., "100")
+      // We look for ANY number.
+      const numMatch = lowerCmd.match(/(\d+)/);
+      const resId = numMatch ? numMatch[1] : null;
 
-      // 4. Action Extraction
+      // Keywords
+      const isResidueKw = lowerCmd.match(/(residue|res|残基|氨基酸|位点)/);
       const isHbond = lowerCmd.match(/bond|interaction|h-bond|氢键/);
-      const isBinding = lowerCmd.match(/(pocket|site|binding|结合|口袋|位点)/) && lowerCmd.match(/(ligand|drug|配体|药)/);
-      const isGlobalHbond = lowerCmd.match(/(global|all|全局|整体)/) && isHbond;
-      const isFocusLigand = lowerCmd.match(/(focus|show|view|看|聚焦)/) && lowerCmd.match(/(ligand|drug|配体|药)/);
+      const isGlobal = lowerCmd.match(/(global|all|全局|整体)/);
+      const isPocket = lowerCmd.match(/(pocket|binding|结合|口袋)/);
+      const isFocus = lowerCmd.match(/(focus|show|view|看|聚焦)/);
+      const isLigand = lowerCmd.match(/(ligand|drug|配体|药)/);
 
-      // -- Execution Phase (Priority: Specific -> General) --
+      // --- 2. Execute based on Specificity (Most Specific First) ---
 
-      // Priority 1: Special Buttons/Modes
-      if (isBinding) {
+      // A. Special Modes
+      if (isPocket && isLigand) {
            setAgentOverlays(prev => [...prev, { type: 'ligand-surround', color: '#ff9900' }]);
-           return "已显示配体结合口袋 (5Å)";
+           return "已显示配体结合口袋";
       }
-      if (isGlobalHbond) {
+      if (isGlobal && isHbond) {
            setAgentOverlays(prev => [...prev, { type: 'global-hbond' }]);
            return "已显示全局氢键网络";
       }
-      if (isFocusLigand) {
+      if (isFocus && isLigand) {
            setShowLigands(true);
+           // Trigger focus in main thread
            const plugin = getPlugin();
            const lig = plugin?.managers.structure.hierarchy.current.structures[0]?.components.find(c => c.key === 'ligand');
            if(lig) plugin.managers.camera.focusLoci(plugin.managers.structure.selection.getLoci(lig.obj.data));
            return "已聚焦配体";
       }
 
-      // Priority 2: Residue Target (Specific)
-      if (start) {
+      // B. Residue Target (Highest Priority for numbers)
+      // Logic: If we found a number, AND (we found 'residue' keyword OR we found a chain ID), assume it's a residue.
+      // e.g., "A链100" -> Chain A, Residue 100.
+      // e.g., "100号" -> Residue 100 (wildcard chain).
+      if (resId && (isResidueKw || chainId)) {
           setAgentOverlays(prev => [...prev, { 
               type: 'residue', 
-              target: `${start}-${end}`, 
-              targetChain: chainId, // Pass chain if found, else null (wildcard)
+              target: `${resId}-${resId}`, // Single residue range
+              targetChain: chainId, // Specific chain or null
               interaction: isHbond, 
               color: isHbond ? '#ffff00' : colorCode, 
               style: 'ball-and-stick' 
           }]);
           const chainText = chainId ? `(链${chainId})` : '';
-          return isHbond ? `显示残基 ${start}${chainText} 氢键` : `标记残基 ${start}${chainText} 为 ${colorCode}`;
+          return isHbond ? `显示残基 ${resId}${chainText} 氢键` : `标记残基 ${resId}${chainText} 为 ${colorCode}`;
       }
 
-      // Priority 3: Chain Target (Semi-Specific)
+      // C. Chain Target (Medium Priority)
+      // Only if no residue number was processed.
       if (chainId) {
-          setAgentOverlays(prev => [...prev, { type: 'chain', target: chainId, style: 'cartoon', color: colorCode }]);
-          return `已将 ${chainId} 链 设为 ${colorCode}`;
+          setAgentOverlays(prev => [...prev, { type: 'chain', target: chainId, color: colorCode }]);
+          return `已标记 ${chainId} 链 (${colorCode})`;
       }
 
-      // Priority 4: Global Color (General)
-      if (hasColor || lowerCmd.includes('global') || lowerCmd.includes('全局')) {
+      // D. Global Color (Low Priority)
+      // Fallback: If only color is mentioned or "global"
+      if (isGlobal || hasColor) {
           setCustomColor(colorCode); 
           setActiveColorMode('uniform'); 
           setActivePreset('custom');
           return "已应用全局颜色";
       }
 
-      // Presets & Clear
+      // E. Other
       if (lowerCmd.includes('nature')) { setActivePreset('nature'); return "Nature 风格"; }
       if (lowerCmd.includes('dark')) { setActivePreset('dark'); return "Dark 风格"; }
-      if (lowerCmd.includes('clear') || lowerCmd.includes('清除') || lowerCmd.includes('reset')) { setAgentOverlays([]); return "已清除所有图层"; }
+      if (lowerCmd.includes('clear') || lowerCmd.includes('清除')) { setAgentOverlays([]); return "已清除图层"; }
 
-      return "指令不明确 (试着说: 'A链100变红', '显示全局氢键')";
+      return "指令不明确 (试着说: 'A链变蓝', '100号残基氢键')";
   };
 
   const handleChatSubmit = async (e) => {
@@ -446,7 +445,7 @@ const BioLensApp = () => {
   return (
     <div className="flex flex-col h-screen w-full bg-slate-50 text-slate-800 font-sans overflow-hidden">
       {toast && (
-          <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-50 bg-slate-800/90 text-white px-4 py-2 rounded-full shadow-xl flex items-center gap-2 animate-fade-in-up transition-all">
+          <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-50 bg-slate-800/90 text-white px-4 py-2 rounded-full shadow-xl flex items-center gap-2 animate-fade-in-up transition-all pointer-events-none">
               <Sparkles size={14} className="text-yellow-400"/>
               <span className="text-xs font-medium">{toast}</span>
           </div>
@@ -475,7 +474,7 @@ const BioLensApp = () => {
            <div ref={containerRef} className="absolute inset-0 w-full h-full" />
            <div className="absolute top-4 left-4 z-10 flex flex-col gap-2">
               <div className="bg-white/90 backdrop-blur px-3 py-1.5 rounded shadow text-xs font-bold text-slate-600 border">ID: {fileName}</div>
-              {agentOverlays.length > 0 && <button onClick={() => setAgentOverlays([])} className="bg-red-500/90 text-white px-3 py-1.5 rounded shadow text-xs font-bold hover:bg-red-600 flex items-center gap-1"><Wand2 size={12}/> Clear Layers ({agentOverlays.length})</button>}
+              {agentOverlays.length > 0 && <button onClick={() => setAgentOverlays([])} className="bg-red-500/90 text-white px-3 py-1.5 rounded shadow text-xs font-bold hover:bg-red-600 flex items-center gap-1 transition-all"><Wand2 size={12}/> Clear Layers ({agentOverlays.length})</button>}
            </div>
         </main>
 
@@ -493,15 +492,15 @@ const BioLensApp = () => {
                             </div>
                         </button>
                         <div className="grid grid-cols-2 gap-2">
-                            <button onClick={() => processAgentCommand("ligand pocket")} className={`flex flex-col items-center justify-center p-2 rounded-lg border transition-all gap-1 ${isLigandPocketActive ? 'bg-amber-100 border-amber-300 text-amber-800 shadow-inner' : 'bg-white hover:bg-amber-50 text-slate-600'}`}>
+                            <button onClick={() => processAgentCommand("ligand pocket")} className={`flex flex-col items-center justify-center p-2 rounded-lg border transition-all gap-1 ${isLigandPocketActive ? 'bg-amber-100 border-amber-300 text-amber-800 shadow-inner scale-95' : 'bg-white hover:bg-amber-50 text-slate-600'}`}>
                                 <Microscope size={16} className={isLigandPocketActive ? "text-amber-700" : "text-amber-500"}/>
                                 <span className="text-[10px] font-medium">Binding Pocket</span>
-                                {isLigandPocketActive && <div className="absolute top-1 right-1 w-2 h-2 bg-green-500 rounded-full"/>}
+                                {isLigandPocketActive && <div className="absolute top-1 right-1 w-2 h-2 bg-green-500 rounded-full animate-pulse"/>}
                             </button>
-                            <button onClick={() => processAgentCommand("global h-bond")} className={`flex flex-col items-center justify-center p-2 rounded-lg border transition-all gap-1 ${isGlobalHbondActive ? 'bg-indigo-100 border-indigo-300 text-indigo-800 shadow-inner' : 'bg-white hover:bg-indigo-50 text-slate-600'}`}>
+                            <button onClick={() => processAgentCommand("global h-bond")} className={`flex flex-col items-center justify-center p-2 rounded-lg border transition-all gap-1 ${isGlobalHbondActive ? 'bg-indigo-100 border-indigo-300 text-indigo-800 shadow-inner scale-95' : 'bg-white hover:bg-indigo-50 text-slate-600'}`}>
                                 <Link2 size={16} className={isGlobalHbondActive ? "text-indigo-700" : "text-indigo-500"}/>
                                 <span className="text-[10px] font-medium">Global H-Bonds</span>
-                                {isGlobalHbondActive && <div className="absolute top-1 right-1 w-2 h-2 bg-green-500 rounded-full"/>}
+                                {isGlobalHbondActive && <div className="absolute top-1 right-1 w-2 h-2 bg-green-500 rounded-full animate-pulse"/>}
                             </button>
                         </div>
                     </div>
@@ -510,20 +509,20 @@ const BioLensApp = () => {
                 <section>
                     <SectionHeader icon={<MousePointer2 size={14} className="text-indigo-500"/>} title="Click Action (点击交互)" />
                     <div className="grid grid-cols-3 gap-2 mt-2">
-                         <button onClick={() => setClickMode('pick')} className={`text-[10px] p-2 rounded border flex flex-col items-center gap-1 transition-all ${clickMode === 'pick' ? 'bg-indigo-600 text-white shadow-md' : 'bg-white hover:bg-slate-50'}`}>
+                         <button onClick={() => setClickMode('pick')} className={`text-[10px] p-2 rounded border flex flex-col items-center gap-1 transition-all ${clickMode === 'pick' ? 'bg-indigo-600 text-white shadow-md transform scale-105' : 'bg-white hover:bg-slate-50'}`}>
                              <MousePointer2 size={14}/> Focus
                          </button>
-                         <button onClick={() => setClickMode('zone5')} className={`text-[10px] p-2 rounded border flex flex-col items-center gap-1 transition-all ${clickMode === 'zone5' ? 'bg-red-600 text-white shadow-md' : 'bg-white hover:bg-red-50'}`}>
+                         <button onClick={() => setClickMode('zone5')} className={`text-[10px] p-2 rounded border flex flex-col items-center gap-1 transition-all ${clickMode === 'zone5' ? 'bg-red-600 text-white shadow-md transform scale-105' : 'bg-white hover:bg-red-50'}`}>
                              <CircleDashed size={14}/> Zone 5Å
                          </button>
-                         <button onClick={() => setClickMode('hbond')} className={`text-[10px] p-2 rounded border flex flex-col items-center gap-1 transition-all ${clickMode === 'hbond' ? 'bg-amber-500 text-white shadow-md' : 'bg-white hover:bg-amber-50'}`}>
+                         <button onClick={() => setClickMode('hbond')} className={`text-[10px] p-2 rounded border flex flex-col items-center gap-1 transition-all ${clickMode === 'hbond' ? 'bg-amber-500 text-white shadow-md transform scale-105' : 'bg-white hover:bg-amber-50'}`}>
                              <Link2 size={14}/> H-Bond
                          </button>
                     </div>
                     <div className="mt-2 text-[10px] text-center text-slate-400 bg-slate-50 py-1 rounded">
-                        {clickMode === 'pick' && "点击: 聚焦 | Click: Focus"}
-                        {clickMode === 'zone5' && "点击: 5Å区域 | Click: 5Å Zone"}
-                        {clickMode === 'hbond' && "点击: 氢键 | Click: H-Bonds"}
+                        {clickMode === 'pick' && "模式：点击原子以聚焦视角"}
+                        {clickMode === 'zone5' && "模式：点击原子显示周围 5Å 残基"}
+                        {clickMode === 'hbond' && "模式：点击原子分析氢键相互作用"}
                     </div>
                 </section>
 
