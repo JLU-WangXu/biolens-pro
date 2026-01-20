@@ -1,1414 +1,477 @@
-下面给你一个**全量可覆盖**的新版 `App.jsx`（整文件复制替换即可）。这一版的核心变化是：
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { 
+  Camera, Sun, Layers, Maximize, Upload, Download, Zap, Droplet, Box, 
+  AlertCircle, Play, Pause, Grid, Scissors, Eye, Disc, Activity, Monitor, Ghost,
+  MessageSquare, Mic, Send, Share2, RefreshCw, Search, Terminal, Cpu, Sparkles, Brain, Palette
+} from 'lucide-react';
 
-* ✅ **不再和 Mol* 默认 preset “打架”**
-  结构加载后，Mol* 会自动生成“主体蛋白/配体”的 representations。你之前“滤镜/颜色不变”的根因就是没有更新到**正在显示的那套 repr**。
-* ✅ **颜色/滤镜改成真正的底层更新：build → update → commit**
-  我会直接遍历当前 structure 的 `representation.representations`，对每个 repr 做 update，再 commit，所以**色卡一定会影响蛋白**（只要 Mol* 正常显示结构）。
-* ✅ **滤镜变化明显**：Nature/Cell 不只是背景，会改变主体表示（cartoon/putty）、透明度、以及额外 surface 层（Glass/Xray/Holo）。
-* ✅ 保留你要的：Binder pocket + AI 自然语言（链/残基/配体/pocket）
+// --- 配置区 ---
+// 建议在环境变量中设置，或者直接填入你的 Key
+const GEMINI_API_KEY = ""; 
+const DEFAULT_PDB = "4HHB";
 
-> 你直接把下面整段代码复制，覆盖 `App.jsx` 全部内容。
-> 改完运行后，你先测试：**色卡染色**、**Nature/Cell 切换**、**Glass/Xray**、**Binder pocket**、**AI 残基染色**。
-
----
-
-```jsx
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import {
-  Camera, Upload, Download, Layers, Maximize, AlertCircle,
-  MessageSquare, Send, Share2, RefreshCw, Search, Droplet, Disc, Box, Monitor, Ghost
-} from "lucide-react";
-
-/** -----------------------------
- *  Load Mol* from CDN (safe)
- * ------------------------------*/
-const loadScript = (src) =>
-  new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) return resolve();
-    const s = document.createElement("script");
-    s.src = src;
-    s.async = true;
-    s.onload = resolve;
-    s.onerror = reject;
-    document.head.appendChild(s);
+// --- 动态脚本加载辅助 ---
+const loadScript = (src) => {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
+    const script = document.createElement('script');
+    script.src = src;
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
   });
+};
 
 const loadStyle = (href) => {
   if (document.querySelector(`link[href="${href}"]`)) return;
-  const l = document.createElement("link");
-  l.rel = "stylesheet";
-  l.href = href;
-  document.head.appendChild(l);
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = href;
+  document.head.appendChild(link);
 };
 
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-
-const COLOR_NAME_MAP = {
-  red: "#ff0000", 红: "#ff0000",
-  blue: "#4f46e5", 蓝: "#4f46e5",
-  green: "#22c55e", 绿: "#22c55e",
-  yellow: "#facc15", 黄: "#facc15",
-  purple: "#a855f7", 紫: "#a855f7",
-  orange: "#f97316", 橙: "#f97316",
-  black: "#000000", 黑: "#000000",
-  white: "#ffffff", 白: "#ffffff",
-  cyan: "#06b6d4", 青: "#06b6d4",
-  pink: "#ec4899", 粉: "#ec4899",
-};
-
-function normalizeHexColor(input) {
-  if (!input) return null;
-  const s = String(input).trim();
-  if (COLOR_NAME_MAP[s]) return COLOR_NAME_MAP[s];
-  const m = s.match(/^#?([0-9a-fA-F]{6})$/);
-  if (m) return `#${m[1].toLowerCase()}`;
-  return null;
-}
-
-function hexToInt(hex) {
-  try {
-    return parseInt(String(hex).replace("#", ""), 16);
-  } catch {
-    return 0x4f46e5;
-  }
-}
-
-/** -----------------------------
- *  AI parsing (robust regex)
- * ------------------------------*/
-function parseAiCommand(raw) {
-  const text = (raw || "").trim();
-  const lower = text.toLowerCase();
-
-  const intent = {
-    raw: text,
-    wantReset: false,
-    wantInteractions: null,    // true/false/null
-    wantTint: null,            // { hex }
-    wantOnlyChains: null,      // ['A','B']
-    wantFocusChains: null,     // ['A','B']
-    residueSelect: null,       // { chain?, seq, aa? }
-    residueColor: null,        // hex
-    wantFocusLigand: false,
-    wantEmphasizeLigand: false,
-    wantPocketRadius: null,
-    wantPocketToggle: null,
-  };
-
-  if (lower.includes("reset") || text.includes("复位") || text.includes("重置")) {
-    intent.wantReset = true;
-    return intent;
-  }
-
-  // interactions
-  if (lower.includes("bond") || lower.includes("interaction") || text.includes("氢键") || text.includes("相互作用")) {
-    intent.wantInteractions = true;
-  }
-  if (lower.includes("hide interactions") || text.includes("关闭相互作用") || text.includes("隐藏氢键")) {
-    intent.wantInteractions = false;
-  }
-
-  // pocket on/off + radius
-  if (lower.includes("pocket off") || text.includes("关闭口袋") || text.includes("隐藏口袋")) intent.wantPocketToggle = false;
-  if (lower.includes("pocket on") || text.includes("显示口袋") || text.includes("打开口袋") || text.includes("开启口袋")) intent.wantPocketToggle = true;
-
-  const pr =
-    text.match(/(?:pocket|口袋|半径|radius)\s*([0-9]{1,2})(?:\s*å|Å)?/i) ||
-    text.match(/([0-9]{1,2})\s*(?:å|Å)\s*(?:pocket|口袋)/i);
-  if (pr && pr[1]) {
-    const r = clamp(parseInt(pr[1], 10), 2, 20);
-    if (!Number.isNaN(r)) intent.wantPocketRadius = r;
-  }
-
-  // ligand focus/emphasize
-  if (text.includes("配体") && (text.includes("放大") || text.includes("突出") || text.includes("强调") || lower.includes("emphasize"))) {
-    intent.wantEmphasizeLigand = true;
-  }
-  if (text.includes("聚焦配体") || lower.includes("focus ligand") || (text.includes("配体") && text.includes("聚焦"))) {
-    intent.wantFocusLigand = true;
-  }
-
-  // tint: "染成红色 / 改成 #ff00ff"
-  const colorWord = text.match(/(?:染色|涂成|变成|改成)\s*([#0-9a-fA-F]{6}|红|蓝|绿|黄|紫|橙|黑|白|青|粉|red|blue|green|yellow|purple|orange|black|white|cyan|pink)/i);
-  if (colorWord?.[1]) {
-    const hx = normalizeHexColor(colorWord[1]);
-    if (hx) intent.wantTint = { hex: hx };
-  } else {
-    const shorthand = lower.match(/\b(red|blue|green|yellow|purple|orange|black|white|cyan|pink)\b/) || text.match(/[红蓝绿黄紫橙黑白青粉]/);
-    if (shorthand) {
-      const token = shorthand[1] || shorthand[0];
-      const hx = normalizeHexColor(token);
-      if (hx) intent.wantTint = { hex: hx };
-    }
-  }
-
-  // chains: A链 B链
-  const chainMatches = text.match(/[A-Za-z0-9]\s*链/g);
-  const chains = [];
-  if (chainMatches) {
-    chainMatches.forEach((m) => {
-      const c = m.replace(/\s*链/g, "").trim().toUpperCase();
-      if (c) chains.push(c);
-    });
-  }
-  if (chains.length) {
-    const only = text.includes("只显示") || text.includes("只看") || text.includes("仅显示") || lower.includes("only show");
-    const focus = text.includes("聚焦") || lower.includes("focus");
-    if (only) intent.wantOnlyChains = Array.from(new Set(chains));
-    else if (focus) intent.wantFocusChains = Array.from(new Set(chains));
-    else intent.wantFocusChains = Array.from(new Set(chains));
-  }
-
-  // residue: A链 57号 / A:57 / LYS57
-  let chain = null;
-  let seq = null;
-  let aa = null;
-
-  const aaMatch = text.match(/\b(ALA|ARG|ASN|ASP|CYS|GLN|GLU|GLY|HIS|ILE|LEU|LYS|MET|PHE|PRO|SER|THR|TRP|TYR|VAL)\b/i);
-  if (aaMatch) aa = aaMatch[1].toUpperCase();
-
-  const chainSeq1 = text.match(/([A-Za-z0-9])\s*[:：]\s*([0-9]{1,4})/);
-  if (chainSeq1) {
-    chain = chainSeq1[1].toUpperCase();
-    seq = parseInt(chainSeq1[2], 10);
-  }
-
-  if (!seq) {
-    const chainSeq2 = text.match(/([A-Za-z0-9])\s*链[^0-9]*([0-9]{1,4})/);
-    if (chainSeq2) {
-      chain = chainSeq2[1].toUpperCase();
-      seq = parseInt(chainSeq2[2], 10);
-    }
-  }
-
-  if (!seq && aa) {
-    const aaSeq = text.match(new RegExp(`${aa}\\s*([0-9]{1,4})`, "i"));
-    if (aaSeq) seq = parseInt(aaSeq[1], 10);
-  }
-
-  if (seq && !Number.isNaN(seq)) {
-    intent.residueSelect = { chain, seq, aa };
-    if (intent.wantTint?.hex) intent.residueColor = intent.wantTint.hex;
-  }
-
-  return intent;
-}
-
-/** -----------------------------
- *  Main Component
- * ------------------------------*/
-export default function BioLens() {
+const BioLens = () => {
+  // --- Refs ---
   const containerRef = useRef(null);
-  const viewerRef = useRef(null);
-
+  const pluginRef = useRef(null);
+  const messagesEndRef = useRef(null);
+  
+  // --- State ---
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-
-  const [fileName, setFileName] = useState("4hhb.pdb");
   const [pdbIdInput, setPdbIdInput] = useState("");
-
-  const [currentStyle, setCurrentStyle] = useState("journal_nature");
-  const [focusMode, setFocusMode] = useState("global");
-
-  const [showInteractions, setShowInteractions] = useState(false);
-
-  // Binder pocket controls
-  const [showPocket, setShowPocket] = useState(true);
-  const [pocketRadius, setPocketRadius] = useState(6);
-
-  // Ligand emphasize
-  const [emphasizeLigand, setEmphasizeLigand] = useState(false);
-
-  // Tint
+  const [currentPdbId, setCurrentPdbId] = useState(DEFAULT_PDB);
+  const [statusMsg, setStatusMsg] = useState("System Initializing...");
+  
+  // 可视化参数
+  const [currentStyle, setCurrentStyle] = useState('cartoon'); 
+  const [colorMode, setColorMode] = useState('chain-id'); 
   const [customColor, setCustomColor] = useState("#4f46e5");
-  const [useCustomColor, setUseCustomColor] = useState(false);
+  const [showWater, setShowWater] = useState(false);
+  const [showHetero, setShowHetero] = useState(true);
 
-  // AI
+  // AI 聊天
   const [aiInput, setAiInput] = useState("");
-  const [aiHistory, setAiHistory] = useState([{ role: "system", text: "System Ready." }]);
+  const [isAiProcessing, setIsAiProcessing] = useState(false);
+  const [aiHistory, setAiHistory] = useState([
+    {role: 'system', text: 'BioLens AI 核心已就绪。请输入 PDB ID 或直接与我对话。'}
+  ]);
 
-  const styles = useMemo(() => ([
-    { id: "journal_nature", name: "Nature", icon: Droplet },
-    { id: "journal_cell", name: "Cell", icon: Disc },
-    { id: "glass", name: "Glass", icon: Box },
-    { id: "hologram", name: "Holo", icon: Monitor },
-    { id: "xray", name: "X-Ray", icon: Ghost },
-  ]), []);
-
-  const modes = useMemo(() => ([
-    { id: "global", name: "Global", icon: Maximize },
-    { id: "binder", name: "Binder", icon: Layers },
-  ]), []);
-
-  /** -----------------------------
-   *  Helpers: plugin ctx & structure
-   * ------------------------------*/
-  const getCtx = () => {
-    const v = viewerRef.current;
-    if (!v) return null;
-    return v.plugin || v;
-  };
-
-  const getFirstStructureWrapper = (ctx) => {
-    try {
-      return ctx?.managers?.structure?.hierarchy?.current?.structures?.[0] || null;
-    } catch {
-      return null;
-    }
-  };
-
-  const getAllReprs = (structureWrapper) => {
-    // Mol* stores reprs in structureWrapper.representation.representations (object map)
-    try {
-      const repsObj = structureWrapper?.representation?.representations;
-      if (!repsObj) return [];
-      return Object.values(repsObj).filter(Boolean);
-    } catch {
-      return [];
-    }
-  };
-
-  /** -----------------------------
-   *  Init viewer
-   * ------------------------------*/
+  // --- 1. 初始化 Mol* ---
   useEffect(() => {
-    const init = async () => {
-      setLoading(true);
-      setError(null);
-
+    const initViewer = async () => {
       try {
-        if (!window.molstar) {
-          loadStyle("https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.css");
-          await loadScript("https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.js");
-        }
-        if (!window.molstar) throw new Error("Mol* engine failed to load.");
+        setLoading(true);
+        setStatusMsg("Loading Mol* Engine...");
+        loadStyle("https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.css");
+        await loadScript("https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.js");
+        
+        if (!window.molstar) throw new Error("Mol* 引擎加载失败，请检查网络");
 
-        // Create viewer
+        // 防止全屏请求报错
+        if (containerRef.current) {
+          containerRef.current.requestFullscreen = () => Promise.resolve();
+        }
+
         const viewer = await window.molstar.Viewer.create(containerRef.current, {
           layoutIsExpanded: false,
           layoutShowControls: false,
           layoutShowRemoteState: false,
           layoutShowSequence: true,
           layoutShowLog: false,
-          layoutShowLeftPanel: true,
           viewportShowExpand: false,
           viewportShowSelectionMode: false,
-          viewportShowAnimation: false,
+          viewportShowAnimation: true,
         });
-
-        viewerRef.current = viewer;
-
-        // Load default PDB
-        await loadPdbFromUrl("https://files.rcsb.org/download/4hhb.pdb");
-
+        
+        pluginRef.current = viewer;
+        
+        // 初始加载默认结构
+        await loadPdbById(DEFAULT_PDB);
+        setLoading(false);
       } catch (e) {
-        console.error(e);
-        setError(`Initialization Failed: ${e.message}`);
+        console.error("Init Error:", e);
+        setError(`初始化失败: ${e.message}`);
         setLoading(false);
       }
     };
 
-    init();
+    initViewer();
 
     return () => {
-      try {
-        viewerRef.current?.dispose?.();
-        viewerRef.current?.plugin?.dispose?.();
-      } catch { /* ignore */ }
+      if (pluginRef.current) {
+        pluginRef.current.dispose();
+      }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** -----------------------------
-   *  Load structure (URL / upload)
-   * ------------------------------*/
-  const getFormat = (nameOrUrl) => {
-    if (!nameOrUrl) return "pdb";
-    const s = String(nameOrUrl).toLowerCase();
-    if (s.endsWith(".bcif")) return "bcif";
-    if (s.endsWith(".cif") || s.endsWith(".mmcif")) return "mmcif";
-    return "pdb";
-  };
+  // --- 2. 核心：视觉渲染应用函数 (修复交互的关键) ---
+  const applyVisuals = useCallback(async () => {
+    const plugin = pluginRef.current;
+    if (!plugin) return;
 
-  const loadPdbFromUrl = async (url) => {
-    const ctx = getCtx();
-    if (!ctx) return;
-    setLoading(true);
-    setError(null);
+    setStatusMsg("Applying Visuals...");
+    const { builders } = plugin;
+    const structures = plugin.managers.structure.hierarchy.current.structures;
+
+    if (structures.length === 0) return;
+    const structureRef = structures[0];
 
     try {
-      await ctx.clear();
-      const format = getFormat(url);
+      // 使用 Mol* 的数据事务（Transaction）一次性完成更新
+      await plugin.dataTransaction(async () => {
+        // 1. 清除当前所有组件（重新构建是最稳定的方式）
+        for (const comp of structureRef.components) {
+          await plugin.managers.structure.hierarchy.remove([comp]);
+        }
 
-      const data = await ctx.builders.data.download({ url }, { state: { isGhost: true } });
-      const traj = await ctx.builders.structure.parseTrajectory(data, format);
-      const model = await ctx.builders.structure.createModel(traj);
-      await ctx.builders.structure.createStructure(model);
+        // 2. 构建聚合物 (Protein/DNA)
+        const polymer = await builders.structure.tryCreateComponentStatic(structureRef.cell, 'polymer', 'Polymer');
+        if (polymer) {
+          let typeName = 'cartoon';
+          if (currentStyle === 'surface') typeName = 'molecular-surface';
+          if (currentStyle === 'ball-stick') typeName = 'ball-and-stick';
+          if (currentStyle === 'spacefill') typeName = 'spacefill';
+          if (currentStyle === 'putty') typeName = 'putty';
+          if (currentStyle === 'wireframe') typeName = 'line';
 
-      // After structure exists: apply styles (this will update underlying reprs)
-      await applyAllVisuals();
+          const colorTheme = colorMode === 'uniform' 
+            ? { name: 'uniform', params: { value: parseInt(customColor.replace('#', ''), 16) } }
+            : { name: colorMode };
 
-      ctx.managers.camera.reset();
-      setLoading(false);
+          await builders.structure.representation.addRepresentation(polymer, { 
+            type: typeName, 
+            color: colorTheme.name,
+            colorParams: colorTheme.params
+          });
+        }
 
+        // 3. 构建配体 (Ligands/Hetero)
+        if (showHetero) {
+          const ligand = await builders.structure.tryCreateComponentStatic(structureRef.cell, 'ligand', 'Ligands');
+          if (ligand) {
+            await builders.structure.representation.addRepresentation(ligand, { 
+              type: 'ball-and-stick', 
+              color: 'element-symbol' 
+            });
+          }
+        }
+
+        // 4. 构建水分母
+        if (showWater) {
+          const water = await builders.structure.tryCreateComponentStatic(structureRef.cell, 'water', 'Water');
+          if (water) {
+            await builders.structure.representation.addRepresentation(water, { 
+              type: 'ball-and-stick', 
+              color: 'uniform',
+              colorParams: { value: 0x4fc3f7 },
+              typeParams: { alpha: 0.5, sizeFactor: 0.2 }
+            });
+          }
+        }
+      });
+      setStatusMsg("Ready.");
     } catch (e) {
-      console.error(e);
-      setError(`加载失败: ${e.message}`);
+      console.error("Visual Apply Error:", e);
+      setStatusMsg("Update Error");
+    }
+  }, [currentStyle, colorMode, customColor, showWater, showHetero]);
+
+  // 监听参数变化并更新
+  useEffect(() => {
+    if (!loading && !error) {
+      applyVisuals();
+    }
+  }, [currentStyle, colorMode, customColor, showWater, showHetero, applyVisuals]);
+
+  // --- 3. 数据加载函数 ---
+  const loadPdbById = async (id) => {
+    const plugin = pluginRef.current;
+    if (!plugin) return;
+    
+    setLoading(true);
+    setStatusMsg(`Fetching ${id}...`);
+    try {
+      await plugin.clear();
+      const url = `https://files.rcsb.org/download/${id.toLowerCase()}.pdb`;
+      const data = await plugin.builders.data.download({ url });
+      const trajectory = await plugin.builders.structure.parseTrajectory(data, 'pdb');
+      await plugin.builders.structure.hierarchy.applyPreset(trajectory, 'default');
+      
+      setCurrentPdbId(id.toUpperCase());
+      setLoading(false);
+      // 加载完成后手动触发一次视觉刷新以应用当前 UI 的 Style
+      setTimeout(applyVisuals, 500);
+    } catch (e) {
+      setError(`无法加载 PDB ${id}: ${e.message}`);
       setLoading(false);
     }
-  };
-
-  const handlePdbFetch = async (e) => {
-    e.preventDefault();
-    const id = pdbIdInput.trim();
-    if (id.length < 4) {
-      alert("请输入有效的 4 位 PDB ID (例如 1CRN)");
-      return;
-    }
-    const pid = id.toLowerCase();
-    setFileName(pid.toUpperCase());
-    setPdbIdInput("");
-    await loadPdbFromUrl(`https://files.rcsb.org/download/${pid}.pdb`);
   };
 
   const handleFileUpload = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const ctx = getCtx();
-    if (!ctx) return;
-
+    const file = e.target.files[0];
+    if (!file || !pluginRef.current) return;
+    
     setLoading(true);
-    setError(null);
-    setFileName(file.name);
-
+    setStatusMsg(`Parsing ${file.name}...`);
     try {
-      await ctx.clear();
-      const format = getFormat(file.name);
-
-      const isBinary = format === "bcif";
-      let data;
-      if (isBinary) {
-        const buf = await file.arrayBuffer();
-        data = await ctx.builders.data.rawData({ data: new Uint8Array(buf), label: file.name });
-      } else {
-        const text = await file.text();
-        data = await ctx.builders.data.rawData({ data: text, label: file.name });
-      }
-
-      const traj = await ctx.builders.structure.parseTrajectory(data, format);
-      const model = await ctx.builders.structure.createModel(traj);
-      await ctx.builders.structure.createStructure(model);
-
-      await applyAllVisuals();
-
-      ctx.managers.camera.reset();
+      await pluginRef.current.clear();
+      const isBinary = file.name.endsWith('.bcif');
+      const reader = new FileReader();
+      
+      reader.onload = async (ev) => {
+        const data = await pluginRef.current.builders.data.rawData({ 
+          data: ev.target.result, 
+          label: file.name 
+        });
+        const trajectory = await pluginRef.current.builders.structure.parseTrajectory(data, isBinary ? 'bcif' : 'pdb');
+        await pluginRef.current.builders.structure.hierarchy.applyPreset(trajectory, 'default');
+        
+        setCurrentPdbId("LOCAL");
+        setLoading(false);
+        setTimeout(applyVisuals, 500);
+      };
+      
+      if (isBinary) reader.readAsArrayBuffer(file);
+      else reader.readAsText(file);
+    } catch (e) {
+      setError("文件读取失败");
       setLoading(false);
-
-    } catch (err) {
-      console.error(err);
-      setError(`解析失败: ${err.message}`);
-      setLoading(false);
-    } finally {
-      // reset input so re-upload same file triggers change
-      try { e.target.value = ""; } catch { /* ignore */ }
     }
   };
 
-  /** -----------------------------
-   *  Core: update underlying representations (the key fix)
-   * ------------------------------*/
-  const updateCanvasProps = async (ctx) => {
-    const canvas = ctx?.canvas3d;
-    if (!canvas?.setProps) return;
-
-    const props = {
-      renderer: { backgroundColor: 0xffffff },
-      postProcessing: {
-        occlusion: { name: "off", params: {} },
-        outline: { name: "off", params: {} },
-      },
-    };
-
-    if (currentStyle === "journal_nature") {
-      props.renderer.backgroundColor = 0xffffff;
-      props.postProcessing.occlusion = {
-        name: "on",
-        params: { samples: 48, radius: 5, bias: 0.8, blurKernelSize: 15, resolutionScale: 1 },
-      };
-    } else if (currentStyle === "journal_cell") {
-      props.renderer.backgroundColor = 0xfdfbf7;
-      props.postProcessing.outline = {
-        name: "on",
-        params: { scale: 1.25, threshold: 0.33, color: 0x000000, includeTransparent: true },
-      };
-      props.postProcessing.occlusion = {
-        name: "on",
-        params: { samples: 48, radius: 4, bias: 1.0, blurKernelSize: 11, resolutionScale: 1 },
-      };
-    } else if (currentStyle === "glass") {
-      props.renderer.backgroundColor = 0x000000;
-      props.postProcessing.outline = {
-        name: "on",
-        params: { scale: 1.05, threshold: 0.38, color: 0xffffff, includeTransparent: true },
-      };
-      props.postProcessing.occlusion = {
-        name: "on",
-        params: { samples: 32, radius: 6, bias: 0.7, blurKernelSize: 9, resolutionScale: 1 },
-      };
-    } else if (currentStyle === "hologram") {
-      props.renderer.backgroundColor = 0x000000;
-      props.postProcessing.outline = {
-        name: "on",
-        params: { scale: 1.45, threshold: 0.25, color: 0x00ffcc, includeTransparent: true },
-      };
-    } else if (currentStyle === "xray") {
-      props.renderer.backgroundColor = 0x111111;
-      props.postProcessing.outline = {
-        name: "on",
-        params: { scale: 1.1, threshold: 0.35, color: 0xffffff, includeTransparent: true },
-      };
-    }
-
+  // --- 4. AI & Gemini 交互 ---
+  const callGemini = async (prompt) => {
+    if (!GEMINI_API_KEY) return "请在代码中配置您的 Gemini API Key。";
     try {
-      canvas.setProps(props);
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }]
+        })
+      });
+      const data = await response.json();
+      return data.candidates?.[0]?.content?.parts?.[0]?.text || "Gemini 未返回有效数据。";
     } catch (e) {
-      // non-fatal if Mol* changes prop schema
-      console.warn("canvas.setProps non-fatal:", e);
+      return "连接 Gemini 失败。";
     }
   };
 
-  const shouldSkipReprForTint = (reprCellObj) => {
-    // Heuristic: don't recolor interactions, and prefer keeping ligand element colors.
-    const label = (reprCellObj?.label || "").toLowerCase();
-    const typeName = (reprCellObj?.data?.params?.type?.name || "").toLowerCase();
-    if (typeName.includes("interactions")) return true;
-    if (label.includes("interaction")) return true;
-    // ligand: often label contains ligand, but not guaranteed
-    if (label.includes("ligand")) return true;
-    return false;
-  };
-
-  const updateRepresentations = async (ctx) => {
-    const s = getFirstStructureWrapper(ctx);
-    if (!s) return;
-
-    const reps = getAllReprs(s);
-    if (!reps.length) return;
-
-    const tintColorInt = hexToInt(customColor);
-    const wantUniform = !!useCustomColor;
-
-    // We'll update existing reprs (the crucial part) so style/tint always shows.
-    const update = ctx.build();
-
-    for (const r of reps) {
-      if (!r?.cell?.obj) continue;
-
-      update.to(r).update((old) => {
-        try {
-          // Safely clone/mutate in place
-          const next = { ...old };
-
-          // 1) Tint: set uniform colorTheme on non-ligand + non-interactions
-          if (wantUniform && !shouldSkipReprForTint(r.cell.obj)) {
-            if (next.colorTheme) {
-              next.colorTheme = { ...next.colorTheme, name: "uniform", params: { value: tintColorInt } };
-            }
-          } else {
-            // if user turned off tint, restore chain-id for non-ligand (best-effort)
-            if (!wantUniform && !shouldSkipReprForTint(r.cell.obj) && next.colorTheme) {
-              next.colorTheme = { ...next.colorTheme, name: "chain-id", params: {} };
-            }
-          }
-
-          // 2) Style: adjust type & params (best-effort, guarded)
-          const t = next.type || next.typeParams ? next.type : next.type; // keep compatibility
-          const typeName = next.type?.name || old?.type?.name;
-
-          // Make Nature vs Cell visible: cartoon -> putty where possible
-          if (currentStyle === "journal_cell") {
-            if (typeName === "cartoon") {
-              next.type = { ...(next.type || {}), name: "putty", params: { ...(next.type?.params || {}) } };
-            }
-          } else {
-            // prefer cartoon in other modes if it was putty
-            if (typeName === "putty") {
-              next.type = { ...(next.type || {}), name: "cartoon", params: { ...(next.type?.params || {}) } };
-            }
-          }
-
-          // Make Glass/Xray/Holo more obvious by alpha + sizeFactor tweaks (only if params exist)
-          const p = next.type?.params ? { ...next.type.params } : null;
-
-          if (p) {
-            if (currentStyle === "glass") {
-              // Many repr types support alpha; if not, it will be ignored by Mol*
-              p.alpha = typeof p.alpha === "number" ? Math.min(p.alpha, 0.35) : 0.35;
-            } else if (currentStyle === "xray") {
-              p.alpha = typeof p.alpha === "number" ? Math.min(p.alpha, 0.20) : 0.20;
-            } else if (currentStyle === "hologram") {
-              p.alpha = typeof p.alpha === "number" ? Math.min(p.alpha, 0.55) : 0.55;
-              // thin look if supported
-              if (typeof p.sizeFactor === "number") p.sizeFactor = Math.min(p.sizeFactor, 0.2);
-            } else {
-              // Nature / others: solid
-              if (typeof p.alpha === "number") p.alpha = 1;
-            }
-            next.type = { ...(next.type || {}), params: p };
-          }
-
-          return next;
-        } catch {
-          return old;
-        }
-      });
-    }
-
-    try {
-      await update.commit();
-    } catch (e) {
-      console.warn("repr update commit non-fatal:", e);
-    }
-  };
-
-  /** -----------------------------
-   *  Add-on layers: interactions, ligand emphasis, pocket
-   *  These are additive; we remove and re-add each time to keep consistent.
-   * ------------------------------*/
-  const removeComponentsByLabelPrefix = async (ctx, prefixList) => {
-    const s = getFirstStructureWrapper(ctx);
-    if (!s) return;
-    const comps = s.components || [];
-    const toRemove = comps.filter((c) => {
-      const label = c?.cell?.obj?.label || "";
-      return prefixList.some((p) => label.startsWith(p));
-    });
-    if (toRemove.length) {
-      try { await ctx.managers.structure.hierarchy.remove(toRemove); } catch { /* ignore */ }
-    }
-  };
-
-  const addEmphasizeLigandLayer = async (ctx) => {
-    const s = getFirstStructureWrapper(ctx);
-    if (!s) return;
-    const MS = window.molstar?.MolScriptBuilder;
-    if (!MS) return;
-
-    try {
-      await removeComponentsByLabelPrefix(ctx, ["Addon:Ligand"]);
-      if (!emphasizeLigand) return;
-
-      const ligandQuery = ctx.managers.structure.selection.fromSelectionQuery("ligand");
-      if (!ligandQuery?.expression) return;
-
-      const comp = await ctx.builders.structure.tryCreateComponentFromExpression(
-        s.cell,
-        ligandQuery.expression,
-        "addon-ligand",
-        { label: "Addon:Ligand" }
-      );
-      if (!comp) return;
-
-      await ctx.builders.structure.representation.addRepresentation(comp, {
-        type: "ball-and-stick",
-        typeParams: { sizeFactor: 0.85 },
-        color: "element-symbol"
-      });
-
-      await ctx.builders.structure.representation.addRepresentation(comp, {
-        type: "molecular-surface",
-        typeParams: { alpha: 0.28, flatShaded: true, doubleSided: true, ignoreLight: false },
-        color: "uniform",
-        colorParams: { value: 0xffffff }
-      });
-    } catch (e) {
-      console.warn("Ligand emphasize layer non-fatal:", e);
-    }
-  };
-
-  const addPocketLayerIfBinder = async (ctx) => {
-    const s = getFirstStructureWrapper(ctx);
-    if (!s) return;
-    const MS = window.molstar?.MolScriptBuilder;
-    if (!MS) return;
-
-    try {
-      await removeComponentsByLabelPrefix(ctx, ["Addon:Pocket"]);
-      if (focusMode !== "binder" || !showPocket) return;
-
-      const ligandQuery = ctx.managers.structure.selection.fromSelectionQuery("ligand");
-      if (!ligandQuery?.expression) return;
-
-      const includeSurroundings = MS?.struct?.modifier?.includeSurroundings;
-      if (typeof includeSurroundings !== "function") return;
-
-      const pocketExp = includeSurroundings({
-        0: ligandQuery.expression,
-        radius: clamp(parseFloat(pocketRadius), 2, 20),
-        "as-whole-residues": true
-      });
-
-      const pocketComp = await ctx.builders.structure.tryCreateComponentFromExpression(
-        s.cell,
-        pocketExp,
-        "addon-pocket",
-        { label: `Addon:Pocket ${clamp(parseFloat(pocketRadius), 2, 20)}Å` }
-      );
-      if (!pocketComp) return;
-
-      await ctx.builders.structure.representation.addRepresentation(pocketComp, {
-        type: "ball-and-stick",
-        typeParams: { sizeFactor: 0.23 },
-        color: "uniform",
-        colorParams: { value: 0xffd400 }
-      });
-      await ctx.builders.structure.representation.addRepresentation(pocketComp, {
-        type: "molecular-surface",
-        typeParams: { alpha: 0.13, flatShaded: true, doubleSided: true, ignoreLight: false },
-        color: "uniform",
-        colorParams: { value: 0xffd400 }
-      });
-    } catch (e) {
-      console.warn("Pocket layer non-fatal:", e);
-    }
-  };
-
-  const addInteractionsLayer = async (ctx) => {
-    const s = getFirstStructureWrapper(ctx);
-    if (!s) return;
-
-    try {
-      await removeComponentsByLabelPrefix(ctx, ["Addon:Interactions"]);
-      if (!showInteractions) return;
-
-      // Add interactions on structure cell directly (safe)
-      const comp = await ctx.builders.structure.tryCreateComponentFromExpression(
-        s.cell,
-        // Use "everything" selection by leaving expression as whole structure
-        // If this fails, we just fallback to addRepresentation on s.cell
-        null,
-        "addon-interactions",
-        { label: "Addon:Interactions" }
-      );
-
-      const target = comp?.cell ? comp : s.cell;
-
-      await ctx.builders.structure.representation.addRepresentation(target, {
-        type: "interactions",
-        typeParams: { lineSizeFactor: 0.05, includeCovalent: false },
-        color: "interaction-type"
-      });
-    } catch (e) {
-      // Fallback: directly add to s.cell
-      try {
-        await ctx.builders.structure.representation.addRepresentation(s.cell, {
-          type: "interactions",
-          typeParams: { lineSizeFactor: 0.05, includeCovalent: false },
-          color: "interaction-type"
-        });
-      } catch { /* ignore */ }
-      console.warn("Interactions non-fatal:", e);
-    }
-  };
-
-  const addExtraSurfaceForGlassXrayHolo = async (ctx) => {
-    // This makes style differences *very* visible even if repr type updates are limited.
-    const s = getFirstStructureWrapper(ctx);
-    if (!s) return;
-
-    try {
-      await removeComponentsByLabelPrefix(ctx, ["Addon:Surface"]);
-      if (!["glass", "xray", "hologram"].includes(currentStyle)) return;
-
-      // Add a surface layer to whole structure (additive)
-      const alpha = currentStyle === "xray" ? 0.12 : currentStyle === "glass" ? 0.10 : 0.18;
-      const colorInt =
-        currentStyle === "hologram"
-          ? (useCustomColor ? hexToInt(customColor) : 0x00ffcc)
-          : 0xffffff;
-
-      const comp = await ctx.builders.structure.tryCreateComponentFromExpression(
-        s.cell,
-        null,
-        "addon-surface",
-        { label: "Addon:Surface" }
-      );
-      const target = comp?.cell ? comp : s.cell;
-
-      await ctx.builders.structure.representation.addRepresentation(target, {
-        type: "molecular-surface",
-        typeParams: { alpha, flatShaded: true, doubleSided: true, ignoreLight: currentStyle === "xray" },
-        color: "uniform",
-        colorParams: { value: colorInt }
-      });
-
-      if (currentStyle === "hologram") {
-        // Add a thin ball-and-stick glow-like layer
-        await ctx.builders.structure.representation.addRepresentation(target, {
-          type: "ball-and-stick",
-          typeParams: { sizeFactor: 0.08, alpha: 0.55 },
-          color: "uniform",
-          colorParams: { value: colorInt }
-        });
-      }
-    } catch (e) {
-      console.warn("Surface add-on non-fatal:", e);
-    }
-  };
-
-  /** -----------------------------
-   *  Apply all visuals (the main pipeline)
-   * ------------------------------*/
-  const applyAllVisuals = async () => {
-    const ctx = getCtx();
-    if (!ctx) return;
-
-    // If structure not ready, do nothing
-    const s = getFirstStructureWrapper(ctx);
-    if (!s) return;
-
-    try {
-      await updateCanvasProps(ctx);
-
-      // IMPORTANT: update existing reprs (this fixes your “颜色/滤镜没变化”)
-      await updateRepresentations(ctx);
-
-      // Add-ons (clear & add)
-      await addExtraSurfaceForGlassXrayHolo(ctx);
-      await addEmphasizeLigandLayer(ctx);
-      await addPocketLayerIfBinder(ctx);
-      await addInteractionsLayer(ctx);
-
-      // Binder focus: focus ligand if possible
-      if (focusMode === "binder") {
-        try {
-          const ligandQuery = ctx.managers.structure.selection.fromSelectionQuery("ligand");
-          if (ligandQuery?.expression) {
-            const comp = await ctx.builders.structure.tryCreateComponentFromExpression(
-              s.cell,
-              ligandQuery.expression,
-              "addon-focus-ligand",
-              { label: "Addon:LigandFocus" }
-            );
-            if (comp?.obj?.data) {
-              const loci = ctx.managers.structure.selection.getLoci(comp.obj.data);
-              ctx.managers.camera.focusLoci(loci);
-            }
-            // clean temp focus comp
-            await removeComponentsByLabelPrefix(ctx, ["Addon:LigandFocus"]);
-          }
-        } catch { /* ignore */ }
-      }
-
-    } catch (e) {
-      console.warn("applyAllVisuals non-fatal:", e);
-    }
-  };
-
-  /** -----------------------------
-   *  React: re-apply when controls change
-   * ------------------------------*/
-  useEffect(() => {
-    if (loading || error) return;
-    const ctx = getCtx();
-    if (!ctx) return;
-
-    // debounce a bit to avoid rapid state spam
-    const t = setTimeout(() => { applyAllVisuals(); }, 30);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    currentStyle, focusMode, showInteractions,
-    showPocket, pocketRadius,
-    emphasizeLigand,
-    customColor, useCustomColor
-  ]);
-
-  /** -----------------------------
-   *  Screenshot
-   * ------------------------------*/
-  const takeScreenshot = () => {
-    const ctx = getCtx();
-    if (ctx?.helpers?.viewportScreenshot?.share) {
-      ctx.helpers.viewportScreenshot.share();
-      return;
-    }
-    try {
-      const canvas = containerRef.current?.querySelector("canvas");
-      if (!canvas) return;
-      const image = canvas.toDataURL("image/png");
-      const link = document.createElement("a");
-      link.href = image;
-      link.download = `BioLens-${Date.now()}.png`;
-      link.click();
-    } catch { /* ignore */ }
-  };
-
-  /** -----------------------------
-   *  Reset
-   * ------------------------------*/
-  const resetView = async () => {
-    setUseCustomColor(false);
-    setCustomColor("#4f46e5");
-    setShowInteractions(false);
-    setEmphasizeLigand(false);
-    setCurrentStyle("journal_nature");
-    setFocusMode("global");
-    setShowPocket(true);
-    setPocketRadius(6);
-
-    const ctx = getCtx();
-    if (ctx) ctx.managers.camera.reset();
-  };
-
-  /** -----------------------------
-   *  AI: residue highlight / chain focus / only show chains
-   * ------------------------------*/
-  const clearAiComponents = async (ctx) => {
-    await removeComponentsByLabelPrefix(ctx, ["AI:"]);
-  };
-
-  const addAiResidueHighlight = async (ctx, residue, colorHex) => {
-    const s = getFirstStructureWrapper(ctx);
-    if (!s) return { ok: false };
-
-    const MS = window.molstar?.MolScriptBuilder;
-    if (!MS) return { ok: false };
-
-    const seq = residue?.seq;
-    const chain = residue?.chain ? String(residue.chain).toUpperCase() : null;
-    if (!seq || Number.isNaN(seq)) return { ok: false };
-
-    const colorInt = hexToInt(colorHex || "#ff0000");
-
-    let exp;
-    if (chain) {
-      exp = MS.struct.generator.atomGroups({
-        "chain-test": MS.core.rel.eq([MS.struct.atomProperty.macromolecular.auth_asym_id(), chain]),
-        "residue-test": MS.core.rel.eq([MS.struct.atomProperty.macromolecular.auth_seq_id(), seq]),
-      });
-    } else {
-      exp = MS.struct.generator.atomGroups({
-        "residue-test": MS.core.rel.eq([MS.struct.atomProperty.macromolecular.auth_seq_id(), seq]),
-      });
-    }
-
-    const label = chain ? `AI:${chain}:${seq}` : `AI:res:${seq}`;
-
-    const comp = await ctx.builders.structure.tryCreateComponentFromExpression(
-      s.cell,
-      exp,
-      "ai-residue",
-      { label }
-    );
-    if (!comp) return { ok: false };
-
-    await ctx.builders.structure.representation.addRepresentation(comp, {
-      type: "ball-and-stick",
-      typeParams: { sizeFactor: 0.38 },
-      color: "uniform",
-      colorParams: { value: colorInt }
-    });
-
-    await ctx.builders.structure.representation.addRepresentation(comp, {
-      type: "molecular-surface",
-      typeParams: { alpha: 0.15, flatShaded: true, doubleSided: true, ignoreLight: false },
-      color: "uniform",
-      colorParams: { value: colorInt }
-    });
-
-    try {
-      const loci = ctx.managers.structure.selection.getLoci(comp.obj.data);
-      ctx.managers.camera.focusLoci(loci);
-    } catch { /* ignore */ }
-
-    return { ok: true };
-  };
-
-  const focusChains = async (ctx, chains) => {
-    const s = getFirstStructureWrapper(ctx);
-    const MS = window.molstar?.MolScriptBuilder;
-    if (!s || !MS) return { ok: false };
-
-    const unique = Array.from(new Set((chains || []).map(c => String(c).toUpperCase()).filter(Boolean)));
-    if (!unique.length) return { ok: false };
-
-    const chainExp = MS.struct.generator.atomGroups({
-      "chain-test": MS.core.logic.or(
-        unique.map(c => MS.core.rel.eq([MS.struct.atomProperty.macromolecular.auth_asym_id(), c]))
-      )
-    });
-
-    await clearAiComponents(ctx);
-
-    const comp = await ctx.builders.structure.tryCreateComponentFromExpression(
-      s.cell,
-      chainExp,
-      "ai-focus-chains",
-      { label: `AI:Focus ${unique.join("+")}` }
-    );
-    if (!comp) return { ok: false };
-
-    await ctx.builders.structure.representation.addRepresentation(comp, {
-      type: "ball-and-stick",
-      typeParams: { sizeFactor: 0.16 },
-      color: "chain-id"
-    });
-
-        try {
-      const loci = ctx.managers.structure.selection.getLoci(comp.obj.data);
-      ctx.managers.camera.focusLoci(loci);
-    } catch { /* ignore */ }
-
-    return { ok: true };
-  };
-
-  const showOnlyChains = async (ctx, chains) => {
-    const s = getFirstStructureWrapper(ctx);
-    const MS = window.molstar?.MolScriptBuilder;
-    if (!s || !MS) return { ok: false };
-
-    const unique = Array.from(new Set((chains || []).map(c => String(c).toUpperCase()).filter(Boolean)));
-    if (!unique.length) return { ok: false };
-
-    // Remove existing base representations so only the selection remains visible
-    try {
-      const reps = getAllReprs(s);
-      if (reps.length) {
-        const upd = ctx.build();
-        for (const r of reps) upd.delete(r);
-        await upd.commit();
-      }
-    } catch (e) {
-      console.warn("showOnlyChains: remove base reprs non-fatal:", e);
-    }
-
-    await clearAiComponents(ctx);
-
-    const chainExp = MS.struct.generator.atomGroups({
-      "chain-test": MS.core.logic.or(
-        unique.map(c => MS.core.rel.eq([MS.struct.atomProperty.macromolecular.auth_asym_id(), c]))
-      )
-    });
-
-    const comp = await ctx.builders.structure.tryCreateComponentFromExpression(
-      s.cell,
-      chainExp,
-      "ai-only-chains",
-      { label: `AI:Only ${unique.join("+")}` }
-    );
-    if (!comp) return { ok: false };
-
-    const tintColorInt = hexToInt(customColor);
-    const wantUniform = !!useCustomColor;
-
-    await ctx.builders.structure.representation.addRepresentation(comp, {
-      type: currentStyle === "journal_cell" ? "putty" : "cartoon",
-      color: wantUniform ? "uniform" : "chain-id",
-      colorParams: wantUniform ? { value: tintColorInt } : {}
-    });
-
-    // If user is in glass/xray/holo, add a surface overlay for visibility
-    try {
-      if (["glass", "xray", "hologram"].includes(currentStyle)) {
-        const alpha = currentStyle === "xray" ? 0.12 : currentStyle === "glass" ? 0.10 : 0.18;
-        const colorInt =
-          currentStyle === "hologram"
-            ? (useCustomColor ? hexToInt(customColor) : 0x00ffcc)
-            : 0xffffff;
-
-        await ctx.builders.structure.representation.addRepresentation(comp, {
-          type: "molecular-surface",
-          typeParams: { alpha, flatShaded: true, doubleSided: true, ignoreLight: currentStyle === "xray" },
-          color: "uniform",
-          colorParams: { value: colorInt }
-        });
-      }
-    } catch { /* ignore */ }
-
-    try {
-      const loci = ctx.managers.structure.selection.getLoci(comp.obj.data);
-      ctx.managers.camera.focusLoci(loci);
-    } catch { /* ignore */ }
-
-    // After hiding everything, keep add-ons consistent
-    setTimeout(() => {
-      try { applyAllVisuals(); } catch { /* ignore */ }
-    }, 0);
-
-    return { ok: true };
-  };
-
-  const focusLigandOnce = async (ctx) => {
-    const s = getFirstStructureWrapper(ctx);
-    if (!s) return { ok: false };
-
-    try {
-      const ligandQuery = ctx.managers.structure.selection.fromSelectionQuery("ligand");
-      if (!ligandQuery?.expression) return { ok: false };
-
-      await removeComponentsByLabelPrefix(ctx, ["AI:Ligand"]);
-
-      const comp = await ctx.builders.structure.tryCreateComponentFromExpression(
-        s.cell,
-        ligandQuery.expression,
-        "ai-ligand",
-        { label: "AI:Ligand" }
-      );
-      if (!comp) return { ok: false };
-
-      await ctx.builders.structure.representation.addRepresentation(comp, {
-        type: "ball-and-stick",
-        typeParams: { sizeFactor: 0.85 },
-        color: "element-symbol"
-      });
-
-      const loci = ctx.managers.structure.selection.getLoci(comp.obj.data);
-      ctx.managers.camera.focusLoci(loci);
-      return { ok: true };
-    } catch (e) {
-      console.warn("focusLigandOnce non-fatal:", e);
-      return { ok: false };
-    }
-  };
-
-  /** -----------------------------
-   *  AI submit
-   * ------------------------------*/
-  const handleAiSubmit = async (e) => {
+  const handleAiCommand = async (e) => {
     e.preventDefault();
     if (!aiInput.trim()) return;
 
-    const userText = aiInput;
-    setAiHistory(prev => [...prev, { role: "user", text: userText }]);
+    const userInput = aiInput;
     setAiInput("");
+    setAiHistory(prev => [...prev, {role: 'user', text: userInput}]);
+    setIsAiProcessing(true);
 
-    const ctx = getCtx();
-    let reply = "指令已接收。";
+    const systemPrompt = `
+      You are BioLens AI. You control a 3D molecule viewer.
+      Current Settings: Style=${currentStyle}, ColorMode=${colorMode}, Water=${showWater}.
+      User Input: "${userInput}"
+      
+      If the user wants to change visuals, return a JSON object (no markdown):
+      {"updates": {"currentStyle": "surface|cartoon|ball-stick|spacefill", "colorMode": "chain-id|element-symbol|uniform", "showWater": true|false}, "message": "Applying changes..."}
+      
+      Otherwise, return:
+      {"message": "Your scientific explanation here."}
+      Return ONLY raw JSON.
+    `;
 
+    const rawResponse = await callGemini(systemPrompt);
     try {
-      const intent = parseAiCommand(userText);
+      const jsonStr = rawResponse.replace(/```json/g, '').replace(/```/g, '').trim();
+      const data = JSON.parse(jsonStr);
 
-      if (intent.wantReset) {
-        await resetView();
-        reply = "视图已重置。";
-        setAiHistory(prev => [...prev, { role: "system", text: reply }]);
-        return;
+      if (data.updates) {
+        if (data.updates.currentStyle) setCurrentStyle(data.updates.currentStyle);
+        if (data.updates.colorMode) setColorMode(data.updates.colorMode);
+        if (data.updates.showWater !== undefined) setShowWater(data.updates.showWater);
       }
-
-      // interactions toggle
-      if (intent.wantInteractions === true) setShowInteractions(true);
-      if (intent.wantInteractions === false) setShowInteractions(false);
-
-      // pocket toggle/radius
-      if (typeof intent.wantPocketToggle === "boolean") setShowPocket(intent.wantPocketToggle);
-      if (typeof intent.wantPocketRadius === "number") setPocketRadius(intent.wantPocketRadius);
-
-      // emphasize ligand
-      if (intent.wantEmphasizeLigand) setEmphasizeLigand(true);
-
-      // residue highlight has priority over global tint
-      if (ctx && intent.residueSelect && intent.residueColor) {
-        await clearAiComponents(ctx);
-        const r = await addAiResidueHighlight(ctx, intent.residueSelect, intent.residueColor);
-        reply = r.ok
-          ? `已高亮 ${intent.residueSelect.chain ? intent.residueSelect.chain + "链 " : ""}${intent.residueSelect.seq} 号残基并染色。`
-          : "残基选择失败（可能残基编号/链不存在）。";
-        setAiHistory(prev => [...prev, { role: "system", text: reply }]);
-        return;
-      }
-
-      // global tint
-      if (intent.wantTint?.hex && !intent.residueSelect) {
-        setCustomColor(intent.wantTint.hex);
-        setUseCustomColor(true);
-        reply = `已设置全局染色为 ${intent.wantTint.hex}。`;
-        setAiHistory(prev => [...prev, { role: "system", text: reply }]);
-        return;
-      }
-
-      // only show chains
-      if (ctx && intent.wantOnlyChains?.length) {
-        const r = await showOnlyChains(ctx, intent.wantOnlyChains);
-        reply = r.ok ? `已仅显示 ${intent.wantOnlyChains.join(" ")} 链。` : "只显示链失败（可能未加载结构）。";
-        setAiHistory(prev => [...prev, { role: "system", text: reply }]);
-        return;
-      }
-
-      // focus chains
-      if (ctx && intent.wantFocusChains?.length) {
-        const r = await focusChains(ctx, intent.wantFocusChains);
-        reply = r.ok ? `已聚焦 ${intent.wantFocusChains.join(" ")} 链。` : "聚焦链失败（可能未加载结构）。";
-        setAiHistory(prev => [...prev, { role: "system", text: reply }]);
-        return;
-      }
-
-      // focus ligand
-      if (ctx && (intent.wantFocusLigand || intent.wantEmphasizeLigand)) {
-        const r = await focusLigandOnce(ctx);
-        reply = r.ok ? "已聚焦配体。" : "未检测到配体（或聚焦失败）。";
-        setAiHistory(prev => [...prev, { role: "system", text: reply }]);
-        return;
-      }
-
-      // pocket text feedback
-      if (intent.wantPocketRadius) {
-        reply = `Pocket 半径已设置为 ${intent.wantPocketRadius}Å。`;
-      } else if (typeof intent.wantPocketToggle === "boolean") {
-        reply = intent.wantPocketToggle ? "已开启 Pocket 高亮。" : "已关闭 Pocket 高亮。";
-      } else if (intent.wantInteractions === true) {
-        reply = "已显示相互作用。";
-      } else if (intent.wantInteractions === false) {
-        reply = "已隐藏相互作用。";
-      } else {
-        reply = "未匹配到可执行动作。试试：只显示A链 / A链57号染红 / 显示口袋8Å / 聚焦配体 / 显示氢键。";
-      }
-
+      setAiHistory(prev => [...prev, {role: 'system', text: data.message}]);
     } catch (err) {
-      console.error(err);
-      reply = "指令解析失败。";
+      setAiHistory(prev => [...prev, {role: 'system', text: rawResponse}]);
     }
-
-    setAiHistory(prev => [...prev, { role: "system", text: reply }]);
+    setIsAiProcessing(false);
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
-  /** -----------------------------
-   *  UI Handlers
-   * ------------------------------*/
-  const toggleInteractions = () => setShowInteractions(v => !v);
-
-  const handleColorChange = (e) => {
-    setCustomColor(e.target.value);
-    setUseCustomColor(true);
-  };
-
-  /** -----------------------------
-   *  Render
-   * ------------------------------*/
+  // --- 5. 渲染布局 ---
   return (
-    <div className="flex flex-col h-screen w-full bg-gray-50 text-gray-800 font-sans overflow-hidden">
-      {/* Top Bar */}
-      <div className="flex items-center justify-between px-6 py-3 bg-white border-b border-gray-200 z-10 shadow-sm">
-        <div className="flex items-center gap-2">
-          <div className="bg-indigo-600 p-1.5 rounded-lg">
-            <Camera className="text-white" size={20} />
+    <div className="flex flex-col h-screen w-full bg-slate-900 text-white font-sans overflow-hidden">
+      
+      {/* 顶部工具栏 */}
+      <header className="flex items-center justify-between px-6 py-3 bg-slate-950 border-b border-slate-800 z-30 shadow-2xl">
+        <div className="flex items-center gap-3">
+          <div className="bg-indigo-600 p-2 rounded-xl">
+            <Cpu className="text-white" size={22} />
           </div>
-          <div>
-            <h1 className="text-xl font-bold text-gray-900 tracking-tight">
-              BioLens <span className="text-indigo-600">Pro</span>
-            </h1>
-            <p className="text-xs text-gray-500">Synthetic Bio Edition</p>
-          </div>
+          <h1 className="text-xl font-black tracking-tighter">BIOLENS <span className="text-indigo-500 text-sm ml-1 font-mono">v2.0</span></h1>
         </div>
 
-        <div className="flex items-center gap-2">
-          <form onSubmit={handlePdbFetch} className="flex items-center border border-gray-300 rounded-md overflow-hidden bg-gray-50">
-            <div className="px-3 text-gray-400"><Search size={14} /></div>
-            <input
-              type="text"
+        <div className="flex items-center gap-4">
+          {/* PDB 获取框 */}
+          <div className="flex items-center bg-slate-800 rounded-lg p-1 border border-slate-700">
+            <Search size={16} className="ml-2 text-slate-400" />
+            <input 
+              className="bg-transparent border-none outline-none px-3 py-1 text-sm w-24 font-bold uppercase placeholder:text-slate-600"
+              placeholder="PDB ID"
               value={pdbIdInput}
-              onChange={(e) => setPdbIdInput(e.target.value.toUpperCase())}
-              placeholder="PDB ID (e.g. 1CRN)"
-              className="w-32 py-1.5 bg-transparent text-sm focus:outline-none"
-              maxLength={4}
+              onChange={e => setPdbIdInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && loadPdbById(pdbIdInput)}
             />
-            <button type="submit" className="px-3 py-1.5 bg-gray-200 hover:bg-gray-300 text-xs font-medium transition-colors">
-              Fetch
-            </button>
-          </form>
-
-          <div className="h-6 w-px bg-gray-300 mx-2"></div>
-
-          <label className="flex items-center gap-2 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-md cursor-pointer transition-colors shadow-sm">
-            <Upload size={16} />
-            <span className="text-sm font-medium">Upload</span>
-            <input
-              type="file"
-              accept=".pdb,.cif,.ent,.mmcif,.bcif"
-              onChange={handleFileUpload}
-              className="hidden"
-            />
-          </label>
-
-          <button
-            onClick={takeScreenshot}
-            className="p-2 border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-md"
-            title="Screenshot"
-          >
-            <Download size={16} />
-          </button>
-        </div>
-      </div>
-
-      <div className="flex flex-1 overflow-hidden">
-        {/* Viewer */}
-        <div className="relative flex-1 bg-gray-100">
-          {error && (
-            <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-50 bg-white p-6 rounded-lg shadow-2xl border-2 border-red-500 max-w-lg w-full">
-              <div className="flex items-center gap-2 text-red-600 font-bold text-lg mb-2"><AlertCircle /> Error</div>
-              <div className="bg-gray-100 p-3 rounded text-sm font-mono text-gray-700 break-words mb-4 max-h-40 overflow-auto">
-                {error}
-              </div>
-              <button onClick={() => setError(null)} className="w-full py-2 bg-gray-200 hover:bg-gray-300 rounded font-medium">
-                Close
-              </button>
-            </div>
-          )}
-
-          {loading && (
-            <div className="absolute inset-0 z-40 flex items-center justify-center bg-white/80">
-              <div className="animate-spin rounded-full h-10 w-10 border-4 border-indigo-600 border-t-transparent"></div>
-            </div>
-          )}
-
-          <div ref={containerRef} className="absolute inset-0 w-full h-full" />
-
-          {/* Floating controls */}
-          <div className="absolute top-4 right-4 z-20 flex gap-2">
-            <button
-              onClick={resetView}
-              className="flex items-center gap-2 px-4 py-2 rounded-full shadow-lg border bg-white text-gray-700 hover:bg-gray-50"
+            <button 
+              onClick={() => loadPdbById(pdbIdInput)}
+              className="bg-indigo-600 hover:bg-indigo-500 px-4 py-1 rounded-md text-xs font-bold transition-all"
             >
-              <RefreshCw size={16} /> <span className="text-sm">Reset</span>
-            </button>
-            <button
-              onClick={toggleInteractions}
-              className={`flex items-center gap-2 px-4 py-2 rounded-full shadow-lg border ${showInteractions ? "bg-indigo-600 text-white" : "bg-white text-gray-700"}`}
-            >
-              <Share2 size={16} /> <span className="text-sm">H-Bonds</span>
+              FETCH
             </button>
           </div>
 
-          {/* AI bar */}
-          <div className="absolute bottom-6 left-1/2 transform -translate-x-1/2 w-full max-w-lg px-4 z-20">
-            {aiHistory.length > 1 && (
-              <div className="mb-2 bg-black/60 backdrop-blur text-white text-xs p-2 rounded-lg max-h-32 overflow-y-auto">
-                {aiHistory.slice(-2).map((m, i) => (
-                  <div key={i} className="mb-1">
-                    <b>{m.role}:</b> {m.text}
+          <label className="flex items-center gap-2 px-4 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-lg cursor-pointer transition-all text-xs font-bold">
+            <Upload size={14} /> LOCAL
+            <input type="file" onChange={handleFileUpload} className="hidden" accept=".pdb,.cif,.bcif" />
+          </label>
+        </div>
+      </header>
+
+      <div className="flex flex-1 overflow-hidden relative">
+        
+        {/* Mol* 视口 */}
+        <main className="flex-1 relative bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-slate-800 to-slate-950">
+           {loading && (
+             <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-slate-900/60 backdrop-blur-md">
+               <div className="w-12 h-12 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+               <p className="text-indigo-400 font-mono text-sm animate-pulse">{statusMsg}</p>
+             </div>
+           )}
+           
+           <div ref={containerRef} className="absolute inset-0 w-full h-full" />
+
+           {/* AI 悬浮对话框 */}
+           <div className="absolute bottom-6 left-6 z-40 w-80 pointer-events-none">
+              <div className="bg-slate-950/90 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden pointer-events-auto flex flex-col max-h-[400px]">
+                <div className="p-3 border-b border-slate-800 bg-slate-900/50 flex items-center gap-2">
+                   <Sparkles size={16} className="text-indigo-400" />
+                   <span className="text-xs font-bold text-slate-300">BioLens AI Assistant</span>
+                </div>
+                <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar text-[11px]">
+                  {aiHistory.map((msg, i) => (
+                    <div key={i} className={`${msg.role === 'user' ? 'text-right' : 'text-left'}`}>
+                      <span className={`inline-block px-3 py-2 rounded-xl ${msg.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-300 border border-slate-700'}`}>
+                        {msg.text}
+                      </span>
+                    </div>
+                  ))}
+                  <div ref={messagesEndRef} />
+                </div>
+                <form onSubmit={handleAiCommand} className="p-3 bg-slate-900">
+                  <div className="relative">
+                    <input 
+                      className="w-full bg-slate-950 border border-slate-700 rounded-full py-2 px-4 pr-10 text-xs focus:ring-2 focus:ring-indigo-500 outline-none"
+                      placeholder="Ask BioLens anything..."
+                      value={aiInput}
+                      onChange={e => setAiInput(e.target.value)}
+                    />
+                    <button type="submit" className="absolute right-2 top-1.5 text-indigo-500">
+                      {isAiProcessing ? <RefreshCw className="animate-spin" size={16}/> : <Send size={16}/>}
+                    </button>
                   </div>
+                </form>
+              </div>
+           </div>
+        </main>
+
+        {/* 右侧控制面板 */}
+        <aside className="w-72 bg-slate-950 border-l border-slate-800 p-5 z-40 flex flex-col gap-8 shadow-[-10px_0_30px_rgba(0,0,0,0.5)] overflow-y-auto">
+           
+           <section>
+              <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-[2px] mb-4 flex items-center gap-2">
+                <Layers size={14} /> Representation
+              </h3>
+              <div className="grid grid-cols-2 gap-2">
+                {['cartoon', 'surface', 'ball-stick', 'putty', 'spacefill', 'wireframe'].map(s => (
+                  <button 
+                    key={s}
+                    onClick={() => setCurrentStyle(s)}
+                    className={`py-2 rounded-lg text-[10px] font-bold border transition-all uppercase
+                    ${currentStyle === s ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-900 border-slate-800 text-slate-500 hover:border-slate-600'}`}
+                  >
+                    {s}
+                  </button>
                 ))}
               </div>
-            )}
-            <form onSubmit={handleAiSubmit} className="relative">
-              <div className="absolute left-3 top-3 text-indigo-400"><MessageSquare size={18} /></div>
-              <input
-                type="text"
-                value={aiInput}
-                onChange={e => setAiInput(e.target.value)}
-                placeholder="AI指令...（例：只显示A链 / A链57号染红 / 显示口袋8Å / 聚焦配体）"
-                className="w-full bg-black/70 backdrop-blur border border-indigo-500/30 text-white pl-10 pr-12 py-3 rounded-full outline-none"
-              />
-              <button type="submit" className="absolute right-2 top-2 p-1.5 bg-indigo-600 rounded-full text-white">
-                <Send size={16} />
-              </button>
-            </form>
-          </div>
-        </div>
+           </section>
 
-        {/* Right Panel */}
-        <div className="w-64 bg-white border-l border-gray-200 p-4 z-20 shadow-xl flex flex-col gap-6 overflow-y-auto">
-          <div>
-            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Styles (滤镜)</h3>
-            <div className="grid grid-cols-2 gap-2">
-              {styles.map(s => (
-                <button
-                  key={s.id}
-                  onClick={() => setCurrentStyle(s.id)}
-                  className={`p-2 rounded-lg border text-xs font-medium transition-colors ${currentStyle === s.id ? "bg-indigo-50 border-indigo-500 text-indigo-700" : "hover:bg-gray-50"}`}
-                >
-                  {s.name}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Scene Focus (场景)</h3>
-            <div className="grid grid-cols-1 gap-2">
-              {modes.map(m => (
-                <button
-                  key={m.id}
-                  onClick={() => setFocusMode(m.id)}
-                  className={`w-full flex items-center justify-between px-3 py-2 rounded-lg border text-xs font-medium ${focusMode === m.id ? "bg-gray-800 text-white" : "hover:bg-gray-50"}`}
-                >
-                  <span className="flex items-center gap-2"><m.icon size={14} /> {m.name}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Binder pocket controls */}
-          <div>
-            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Binder Pocket</h3>
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-xs text-gray-600">Show Pocket</span>
-              <button
-                onClick={() => setShowPocket(v => !v)}
-                className={`px-2 py-1 rounded text-[11px] border ${showPocket ? "bg-indigo-50 border-indigo-500 text-indigo-700" : "hover:bg-gray-50 text-gray-600"}`}
+           <section>
+              <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-[2px] mb-4 flex items-center gap-2">
+                <Palette size={14} /> Color Engine
+              </h3>
+              <select 
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-300 outline-none focus:ring-1 focus:ring-indigo-500"
+                value={colorMode}
+                onChange={e => setColorMode(e.target.value)}
               >
-                {showPocket ? "ON" : "OFF"}
-              </button>
-            </div>
-            <div className="text-[11px] text-gray-500 mb-1">Radius: {pocketRadius}Å</div>
-            <input
-              type="range"
-              min={2}
-              max={12}
-              step={1}
-              value={pocketRadius}
-              onChange={(e) => setPocketRadius(parseInt(e.target.value, 10))}
-              className="w-full"
-            />
-            <div className="mt-2 text-[11px] text-gray-500">
-              * 仅在 Binder 模式 + 有配体时生效
-            </div>
-          </div>
+                <option value="chain-id">Chain ID</option>
+                <option value="element-symbol">Atom Element</option>
+                <option value="residue-name">Residue Type</option>
+                <option value="hydrophobicity">Hydrophobicity</option>
+                <option value="uniform">Uniform Custom</option>
+              </select>
 
-          {/* Ligand emphasize */}
-          <div>
-            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Ligand</h3>
-            <button
-              onClick={() => setEmphasizeLigand(v => !v)}
-              className={`w-full px-3 py-2 rounded-lg border text-xs font-medium ${emphasizeLigand ? "bg-indigo-50 border-indigo-500 text-indigo-700" : "hover:bg-gray-50 text-gray-700"}`}
-            >
-              {emphasizeLigand ? "Emphasize: ON" : "Emphasize: OFF"}
-            </button>
-            <div className="mt-2 text-[11px] text-gray-500">
-              * AI 可用：突出配体 / 聚焦配体
-            </div>
-          </div>
-
-          <div>
-            <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Tint (染色)</h3>
-            <div className="flex items-center gap-2">
-              <input
-                type="color"
-                value={customColor}
-                onChange={handleColorChange}
-                className="w-full h-8 cursor-pointer rounded border border-gray-200"
-              />
-              {useCustomColor && (
-                <button
-                  onClick={() => { setUseCustomColor(false); setCustomColor("#4f46e5"); }}
-                  className="text-[10px] text-gray-500 underline"
-                >
-                  Reset
-                </button>
+              {colorMode === 'uniform' && (
+                <div className="mt-4 p-3 bg-slate-900 rounded-xl border border-slate-800">
+                  <p className="text-[10px] text-slate-500 mb-2 uppercase font-bold">Pick Color</p>
+                  <div className="flex items-center gap-3">
+                    <input 
+                      type="color" 
+                      className="w-10 h-10 bg-transparent cursor-pointer rounded-md overflow-hidden border-none"
+                      value={customColor}
+                      onChange={e => setCustomColor(e.target.value)}
+                    />
+                    <span className="text-xs font-mono text-slate-400">{customColor.toUpperCase()}</span>
+                  </div>
+                </div>
               )}
-            </div>
-            <div className="mt-2 text-[11px] text-gray-500">
-              * 这版 Tint 会直接更新 Mol* 当前显示的 representations
-            </div>
-          </div>
+           </section>
 
-          <div className="text-[11px] text-gray-500">
-            <div className="font-medium text-gray-600 mb-1">Loaded:</div>
-            <div className="break-words">{fileName}</div>
-          </div>
-        </div>
+           <section>
+              <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-[2px] mb-4 flex items-center gap-2">
+                <Activity size={14} /> Visibility
+              </h3>
+              <div className="space-y-3">
+                <Toggle label="Solvent (H2O)" active={showWater} onClick={() => setShowWater(!showWater)} color="text-blue-400" />
+                <Toggle label="Hetero-atoms" active={showHetero} onClick={() => setShowHetero(!showHetero)} color="text-emerald-400" />
+              </div>
+           </section>
+
+           <div className="mt-auto border-t border-slate-800 pt-5">
+              <button 
+                onClick={() => pluginRef.current?.managers.camera.reset()}
+                className="w-full py-3 bg-slate-900 hover:bg-slate-800 text-slate-400 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 border border-slate-800"
+              >
+                <RefreshCw size={14} /> RESET CAMERA
+              </button>
+           </div>
+
+        </aside>
       </div>
     </div>
   );
-}
+};
+
+// 辅助组件：开关按钮
+const Toggle = ({ label, active, onClick, color }) => (
+  <button 
+    onClick={onClick}
+    className={`w-full flex items-center justify-between p-3 rounded-xl border transition-all
+    ${active ? 'bg-slate-900 border-slate-700' : 'bg-slate-950 border-transparent opacity-50'}`}
+  >
+    <span className="text-xs font-bold text-slate-400">{label}</span>
+    <div className={`w-2 h-2 rounded-full shadow-[0_0_8px_rgba(0,0,0,0.5)] ${active ? color.replace('text', 'bg') : 'bg-slate-800'}`} />
+  </button>
+);
+
+export default BioLens;
