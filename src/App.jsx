@@ -1,20 +1,19 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+// 1. 清理未使用的图标引用，防止构建失败 (Lint Error Fix)
 import { 
-  Camera, Upload, Download, Search, Zap, Droplet, Box, 
-  AlertCircle, RefreshCw, Eye, MessageSquare, Send,
-  Cpu, Layers, Settings, Maximize, Sparkles, Wand2, Palette,
+  Upload, Search, AlertCircle, RefreshCw, MessageSquare, Send,
+  Cpu, Layers, Sparkles, Wand2, Palette,
   MousePointer2, CircleDashed, Link2, Target, Microscope, ScanSearch
 } from 'lucide-react';
 
 /**
- * BioLens Agent Pro - V4.0 (High Contrast & Logic Fix)
+ * BioLens Agent Pro - V4.1 (Deployment Fix)
  * * Update Log:
- * 1. [Visual] Changed Chain Overlay to 'ball-and-stick' to fix "no visual response" issue (z-fighting).
- * 2. [Logic] Rewrote Command Parser: Logic is now "Feature Detection" based, not strict Regex groups.
- * 3. [Fix] Global H-Bond logic simplified to ensure "全局氢键" always triggers.
- * 4. [UX] Added clear visual cues (Toast + Chat response) for every action.
+ * 1. [Build Fix] Removed unused Lucide imports (Camera, Download, etc.) to pass Vercel build.
+ * 2. [Logic Fix] Added 'loading' dependency to Click Listener to ensure it binds AFTER viewer init.
+ * 3. [Stability] Retained all V4.0 visual and agent logic features.
  */
 
 // -----------------------------------------------------------------------------
@@ -91,6 +90,9 @@ const BioLensApp = () => {
       setTimeout(() => setToast(null), 3000);
   };
 
+  // Helper to safely get plugin instance
+  const getPlugin = useCallback(() => viewerRef.current?.plugin, []);
+
   // ---------------------------------------------------------------------------
   // Init
   // ---------------------------------------------------------------------------
@@ -115,14 +117,14 @@ const BioLensApp = () => {
     };
     init();
     return () => viewerRef.current?.dispose();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const getPlugin = () => viewerRef.current?.plugin;
-
   // ---------------------------------------------------------------------------
-  // Click Listener
+  // Click Listener (Added 'loading' dependency to ensure binding happens)
   // ---------------------------------------------------------------------------
   useEffect(() => {
+    if (loading) return; // Wait for init
     const plugin = getPlugin();
     if (!plugin) return;
 
@@ -168,7 +170,7 @@ const BioLensApp = () => {
     });
 
     return () => clickSub.unsubscribe();
-  }, [clickMode]);
+  }, [clickMode, loading, getPlugin]); // Added loading/getPlugin to ensures we bind after init
 
   // ---------------------------------------------------------------------------
   // Core: Visual Sync
@@ -196,7 +198,7 @@ const BioLensApp = () => {
                 canvas.setProps({ renderer: rendererProps, postProcessing: postProps });
             }
 
-            // 2. Clean Base (Safe Delete)
+            // 2. Clean Base
             const currentComponents = structure.components;
             const componentsToDelete = [];
             for (const c of currentComponents) {
@@ -218,7 +220,7 @@ const BioLensApp = () => {
                 });
             }
 
-            // 4. Standard Details
+            // 4. Details
             if (showLigands) {
                 const ligandComp = await plugin.builders.structure.tryCreateComponentStatic(structure.cell, 'ligand');
                 if (ligandComp && state.cells.has(ligandComp.ref)) await plugin.builders.structure.representation.addRepresentation(ligandComp, { type: 'ball-and-stick', color: 'element-symbol' });
@@ -228,7 +230,7 @@ const BioLensApp = () => {
                 if (waterComp && state.cells.has(waterComp.ref)) await plugin.builders.structure.representation.addRepresentation(waterComp, { type: 'ball-and-stick', color: 'uniform', colorParams: { value: 0x88ccff }, typeParams: { alpha: 0.4 } });
             }
 
-            // 5. AGENT OVERLAYS (The Highlight System)
+            // 5. AGENT OVERLAYS
             const MS = window.molstar?.MolScriptBuilder;
             if (!MS) return;
 
@@ -252,7 +254,6 @@ const BioLensApp = () => {
                     const [start, end] = overlay.target.split('-').map(Number);
                     const endRes = end || start;
                     const resTest = MS.core.logic.and([ MS.core.rel.gr([MS.struct.atomProperty.macromolecular.auth_seq_id(), start - 1]), MS.core.rel.lt([MS.struct.atomProperty.macromolecular.auth_seq_id(), endRes + 1]) ]);
-                    // If targetChain is null, we don't constrain by chain (useful for "Residue 100 on ALL chains")
                     expression = MS.struct.generator.atomGroups({ 'residue-test': resTest, 'chain-test': chainTest || true });
                 }
                 else if (overlay.type === 'zone') {
@@ -284,7 +285,7 @@ const BioLensApp = () => {
             }
         });
     } catch (err) { console.error("Render Error:", err); }
-  }, [activePreset, activeStyle, activeColorMode, customColor, showWater, showLigands, agentOverlays]);
+  }, [activePreset, activeStyle, activeColorMode, customColor, showWater, showLigands, agentOverlays, getPlugin]);
 
   useEffect(() => { if (!loading) syncVisuals(); }, [syncVisuals, loading]);
 
@@ -326,14 +327,11 @@ const BioLensApp = () => {
   };
 
   // ---------------------------------------------------------------------------
-  // Agent Logic (Rewritten for V4.0)
+  // Agent Logic
   // ---------------------------------------------------------------------------
   const processAgentCommand = async (cmd) => {
       const lowerCmd = cmd.toLowerCase();
       
-      // --- 1. Detect Intent Features ---
-      
-      // Color
       let colorCode = '#ff0000'; // Default
       let hasColor = false;
       if (lowerCmd.match(/red|红/)) { colorCode = '#ff0000'; hasColor = true; }
@@ -343,26 +341,18 @@ const BioLensApp = () => {
       else if (lowerCmd.match(/purple|紫/)) { colorCode = '#800080'; hasColor = true; }
       else if (lowerCmd.match(/cyan|青/)) { colorCode = '#00ffff'; hasColor = true; }
 
-      // Chain ID (e.g., "A")
-      // Match "Chain A", "A链", or just "A" if context is right? No, keep it safe.
-      // "A链" -> match[1] = "A"
       const chainMatch = cmd.match(/(?:chain|链)\s*([a-zA-Z0-9])/i) || cmd.match(/([a-zA-Z0-9])\s*(?:chain|链)/i);
       const chainId = chainMatch ? chainMatch[1].toUpperCase() : null;
 
-      // Residue ID (e.g., "100")
-      // We look for ANY number.
       const numMatch = lowerCmd.match(/(\d+)/);
       const resId = numMatch ? numMatch[1] : null;
 
-      // Keywords
       const isResidueKw = lowerCmd.match(/(residue|res|残基|氨基酸|位点)/);
       const isHbond = lowerCmd.match(/bond|interaction|h-bond|氢键/);
       const isGlobal = lowerCmd.match(/(global|all|全局|整体)/);
       const isPocket = lowerCmd.match(/(pocket|binding|结合|口袋)/);
       const isFocus = lowerCmd.match(/(focus|show|view|看|聚焦)/);
       const isLigand = lowerCmd.match(/(ligand|drug|配体|药)/);
-
-      // --- 2. Execute based on Specificity (Most Specific First) ---
 
       // A. Special Modes
       if (isPocket && isLigand) {
@@ -375,50 +365,37 @@ const BioLensApp = () => {
       }
       if (isFocus && isLigand) {
            setShowLigands(true);
-           // Trigger focus in main thread
            const plugin = getPlugin();
            const lig = plugin?.managers.structure.hierarchy.current.structures[0]?.components.find(c => c.key === 'ligand');
            if(lig) plugin.managers.camera.focusLoci(plugin.managers.structure.selection.getLoci(lig.obj.data));
            return "已聚焦配体";
       }
 
-      // B. Residue Target (Highest Priority for numbers)
-      // Logic: If we found a number, AND (we found 'residue' keyword OR we found a chain ID), assume it's a residue.
-      // e.g., "A链100" -> Chain A, Residue 100.
-      // e.g., "100号" -> Residue 100 (wildcard chain).
+      // B. Residue Target
       if (resId && (isResidueKw || chainId)) {
           setAgentOverlays(prev => [...prev, { 
-              type: 'residue', 
-              target: `${resId}-${resId}`, // Single residue range
-              targetChain: chainId, // Specific chain or null
-              interaction: isHbond, 
-              color: isHbond ? '#ffff00' : colorCode, 
-              style: 'ball-and-stick' 
+              type: 'residue', target: `${resId}-${resId}`, targetChain: chainId,
+              interaction: isHbond, color: isHbond ? '#ffff00' : colorCode, style: 'ball-and-stick' 
           }]);
           const chainText = chainId ? `(链${chainId})` : '';
           return isHbond ? `显示残基 ${resId}${chainText} 氢键` : `标记残基 ${resId}${chainText} 为 ${colorCode}`;
       }
 
-      // C. Chain Target (Medium Priority)
-      // Only if no residue number was processed.
+      // C. Chain Target
       if (chainId) {
           setAgentOverlays(prev => [...prev, { type: 'chain', target: chainId, color: colorCode }]);
           return `已标记 ${chainId} 链 (${colorCode})`;
       }
 
-      // D. Global Color (Low Priority)
-      // Fallback: If only color is mentioned or "global"
+      // D. Global Color
       if (isGlobal || hasColor) {
-          setCustomColor(colorCode); 
-          setActiveColorMode('uniform'); 
-          setActivePreset('custom');
+          setCustomColor(colorCode); setActiveColorMode('uniform'); setActivePreset('custom');
           return "已应用全局颜色";
       }
 
-      // E. Other
       if (lowerCmd.includes('nature')) { setActivePreset('nature'); return "Nature 风格"; }
       if (lowerCmd.includes('dark')) { setActivePreset('dark'); return "Dark 风格"; }
-      if (lowerCmd.includes('clear') || lowerCmd.includes('清除')) { setAgentOverlays([]); return "已清除图层"; }
+      if (lowerCmd.includes('clear') || lowerCmd.includes('清除') || lowerCmd.includes('reset')) { setAgentOverlays([]); return "已清除所有图层"; }
 
       return "指令不明确 (试着说: 'A链变蓝', '100号残基氢键')";
   };
