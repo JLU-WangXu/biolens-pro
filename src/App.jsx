@@ -1,98 +1,104 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
-  Camera, Layers, Upload, Search, Cpu, Sparkles, Palette, Activity, Send, AlertCircle, RefreshCw, Trash2
+  Camera, Layers, Upload, Download, Search, Cpu, Sparkles, Palette, 
+  Activity, Send, AlertCircle, RefreshCw, Eye, Box
 } from 'lucide-react';
 
-// --- 配置 ---
-const GEMINI_API_KEY = ""; // 选填，不填不影响基础 3D 功能
-const DEFAULT_PDB = "4HHB";
+// --- 配置区 ---
+const GEMINI_API_KEY = ""; 
+const DEFAULT_ID = "4HHB";
 
-const BioLensV3 = () => {
+const BioLensFinal = () => {
   // --- Refs ---
   const containerRef = useRef(null);
-  const pluginRef = useRef(null); // 存储 Mol* 实例
+  const pluginRef = useRef(null);
   
-  // --- UI 状态 ---
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [pdbInput, setPdbInput] = useState("");
-  const [activeId, setActiveId] = useState(DEFAULT_PDB);
-  
-  // --- 3D 视觉参数 (这些状态改变时会触发 3D 刷新) ---
-  const [style, setStyle] = useState('cartoon'); // cartoon, surface, ball-and-stick, spacefill, line
-  const [colorScheme, setColorScheme] = useState('chain-id'); // chain-id, element-symbol, hydrophobicity, uniform
-  const [uniformColor, setUniformColor] = useState("#4f46e5");
+  // --- 系统状态 ---
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [isBusy, setIsBusy] = useState(false);
+  const [errorDetails, setErrorDetails] = useState(null);
+  const [currentId, setCurrentId] = useState(DEFAULT_ID);
+  const [searchPdb, setSearchPdb] = useState("");
+
+  // --- 视觉同步状态 (交互核心) ---
+  const [reprStyle, setReprStyle] = useState('cartoon'); // cartoon, molecular-surface, ball-and-stick, spacefill
+  const [colorTheme, setColorTheme] = useState('chain-id'); // chain-id, element-symbol, hydrophobicity, uniform
+  const [hexColor, setHexColor] = useState("#4f46e5");
   const [showWater, setShowWater] = useState(false);
-  const [showLigands, setShowLigands] = useState(true);
+  const [showHetero, setShowHetero] = useState(true);
 
-  // --- AI 状态 ---
-  const [chatInput, setChatInput] = useState("");
-  const [aiHistory, setAiHistory] = useState([{ role: 'system', text: 'BioLens 核心引擎就绪。您可以尝试更改样式或上传文件。' }]);
-  const [isAiThinking, setIsAiThinking] = useState(false);
+  // --- 1. 核心视觉引擎：确保画风正确 ---
+  const syncVisuals = useCallback(async () => {
+    const ctx = pluginRef.current;
+    if (!ctx) return;
 
-  // --- 核心：视觉渲染函数 (这是响应右侧点击的关键) ---
-  const update3DVisuals = useCallback(async () => {
-    const plugin = pluginRef.current;
-    if (!plugin) return;
-
-    // 获取当前场景中的所有结构
-    const structures = plugin.managers.structure.hierarchy.current.structures;
+    // 获取当前结构
+    const structures = ctx.managers.structure.hierarchy.current.structures;
     if (structures.length === 0) return;
 
-    // 针对每个加载的结构应用样式 (通常只有一个)
-    for (const s of structures) {
-      await plugin.dataTransaction(async () => {
-        // 1. 清除旧的表示组件，保持干净的画布
-        for (const c of s.components) {
-          await plugin.managers.structure.hierarchy.remove([c]);
+    const struct = structures[0];
+    
+    try {
+      setIsBusy(true);
+      // 使用数据事务：确保清除和创建是原子操作，防止中途报错
+      await ctx.dataTransaction(async () => {
+        // 1. 清理现有所有显示组件
+        for (const comp of struct.components) {
+          await ctx.managers.structure.hierarchy.remove([comp]);
         }
 
-        // 2. 创建主聚合物 (蛋白质/核酸)
-        const polymer = await plugin.builders.structure.tryCreateComponentStatic(s.cell, 'polymer');
+        // 2. 创建聚合物 (Protein/DNA)
+        const polymer = await ctx.builders.structure.tryCreateComponentStatic(struct.cell, 'polymer');
         if (polymer) {
-          const colorParams = colorScheme === 'uniform' 
-            ? { name: 'uniform', params: { value: parseInt(uniformColor.replace('#', ''), 16) } }
-            : { name: colorScheme };
+          const colorParams = colorTheme === 'uniform' 
+            ? { name: 'uniform', params: { value: parseInt(hexColor.replace('#', ''), 16) } }
+            : { name: colorTheme };
 
-          await plugin.builders.structure.representation.addRepresentation(polymer, { 
-            type: style === 'ball-and-stick' ? 'ball-and-stick' : (style === 'surface' ? 'molecular-surface' : style), 
+          await ctx.builders.structure.representation.addRepresentation(polymer, { 
+            type: reprStyle, 
             color: colorParams.name,
-            colorParams: colorParams.params
+            colorParams: colorParams.params,
+            typeParams: { quality: 'auto', alpha: 1.0 }
           });
         }
 
-        // 3. 创建配体 (Ligands)
-        if (showLigands) {
-          const ligands = await plugin.builders.structure.tryCreateComponentStatic(s.cell, 'ligand');
+        // 3. 创建配体/异质原子
+        if (showHetero) {
+          const ligands = await ctx.builders.structure.tryCreateComponentStatic(struct.cell, 'ligand');
           if (ligands) {
-            await plugin.builders.structure.representation.addRepresentation(ligands, { 
+            await ctx.builders.structure.representation.addRepresentation(ligands, { 
               type: 'ball-and-stick', 
-              color: 'element-symbol' 
+              color: 'element-symbol',
+              typeParams: { sizeFactor: 0.3 }
             });
           }
         }
 
-        // 4. 创建水分子
+        // 4. 创建水
         if (showWater) {
-          const water = await plugin.builders.structure.tryCreateComponentStatic(s.cell, 'water');
+          const water = await ctx.builders.structure.tryCreateComponentStatic(struct.cell, 'water');
           if (water) {
-            await plugin.builders.structure.representation.addRepresentation(water, { 
+            await ctx.builders.structure.representation.addRepresentation(water, { 
               type: 'ball-and-stick', 
               color: 'uniform',
               colorParams: { value: 0x4fc3f7 },
-              typeParams: { alpha: 0.4, sizeFactor: 0.2 }
+              typeParams: { alpha: 0.3, sizeFactor: 0.1 }
             });
           }
         }
       });
+    } catch (err) {
+      console.error("Visual Sync Error:", err);
+      setErrorDetails("视觉同步失败: " + err.message);
+    } finally {
+      setIsBusy(false);
     }
-  }, [style, colorScheme, uniformColor, showWater, showLigands]);
+  }, [reprStyle, colorTheme, hexColor, showWater, showHetero]);
 
-  // --- 生命周期：初始化 Mol* ---
+  // --- 2. 生命周期：初始化引擎 ---
   useEffect(() => {
-    const init = async () => {
+    const initEngine = async () => {
       try {
-        // 动态加载资源
         if (!window.molstar) {
           const link = document.createElement('link');
           link.rel = 'stylesheet';
@@ -101,7 +107,7 @@ const BioLensV3 = () => {
 
           const script = document.createElement('script');
           script.src = 'https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.js';
-          await new Promise(r => { script.onload = r; document.head.appendChild(script); });
+          await new Promise(res => { script.onload = res; document.head.appendChild(script); });
         }
 
         const viewer = await window.molstar.Viewer.create(containerRef.current, {
@@ -114,245 +120,254 @@ const BioLensV3 = () => {
         });
 
         pluginRef.current = viewer;
-        await loadByPdbId(DEFAULT_PDB);
-        setLoading(false);
+        await handleFetchPdb(DEFAULT_ID);
+        setIsInitializing(false);
       } catch (e) {
-        setError("引擎启动失败: " + e.message);
+        setErrorDetails("引擎初始化失败: " + e.message);
       }
     };
-    init();
+    initEngine();
     return () => pluginRef.current?.dispose();
   }, []);
 
-  // 监听交互状态变化，实时更新 3D
+  // 核心：监听 React 状态，驱动 Mol* 更新
   useEffect(() => {
-    if (!loading) update3DVisuals();
-  }, [style, colorScheme, uniformColor, showWater, showLigands, loading, update3DVisuals]);
+    if (!isInitializing) syncVisuals();
+  }, [reprStyle, colorTheme, hexColor, showWater, showHetero, isInitializing, syncVisuals]);
 
-  // --- 数据加载器 ---
-  const loadByPdbId = async (id) => {
-    const plugin = pluginRef.current;
-    if (!plugin || !id) return;
-    setLoading(true);
+  // --- 3. 数据加载逻辑：解决“读取失败” ---
+  const handleFetchPdb = async (id) => {
+    const ctx = pluginRef.current;
+    if (!ctx || !id) return;
+
+    setIsBusy(true);
     try {
-      await plugin.clear();
+      await ctx.clear();
       const url = `https://files.rcsb.org/download/${id.toLowerCase()}.pdb`;
-      const data = await plugin.builders.data.download({ url });
-      const traj = await plugin.builders.structure.parseTrajectory(data, 'pdb');
-      await plugin.builders.structure.hierarchy.applyPreset(traj, 'default');
-      setActiveId(id.toUpperCase());
-      setTimeout(update3DVisuals, 200); // 确保预设加载后覆盖我们自己的视觉设置
+      
+      // 使用 Molstar 内置的 download 确保流式传输
+      const data = await ctx.builders.data.download({ url, isBinary: false });
+      const traj = await ctx.builders.structure.parseTrajectory(data, 'pdb');
+      await ctx.builders.structure.hierarchy.applyPreset(traj, 'default');
+      
+      setCurrentId(id.toUpperCase());
+      setErrorDetails(null);
+      setTimeout(syncVisuals, 100); 
     } catch (e) {
-      setError("无法获取 PDB 数据");
+      console.error("Fetch Error:", e);
+      setErrorDetails(`无法加载 PDB ${id}: 网络错误或ID不存在`);
     } finally {
-      setLoading(false);
+      setIsBusy(false);
     }
   };
 
-  const handleFileUpload = async (e) => {
+  const handleLocalFile = async (e) => {
     const file = e.target.files[0];
     if (!file || !pluginRef.current) return;
-    setLoading(true);
+
+    setIsBusy(true);
+    setErrorDetails(null);
     try {
       await pluginRef.current.clear();
-      const isCif = file.name.endsWith('.cif') || file.name.endsWith('.bcif');
-      const reader = new FileReader();
-      reader.onload = async (ev) => {
-        const data = await pluginRef.current.builders.data.rawData({ data: ev.target.result });
-        const traj = await pluginRef.current.builders.structure.parseTrajectory(data, isCif ? 'mmcif' : 'pdb');
-        await pluginRef.current.builders.structure.hierarchy.applyPreset(traj, 'default');
-        setActiveId(file.name);
-        setLoading(false);
-        setTimeout(update3DVisuals, 200);
-      };
-      reader.readAsText(file);
-    } catch (e) {
-      setError("文件读取失败");
-      setLoading(false);
+      
+      // 关键改进：使用 ArrayBuffer 处理，防止编码问题导致的解析失败
+      const buffer = await file.arrayBuffer();
+      const binaryData = new Uint8Array(buffer);
+      
+      const fileName = file.name.toLowerCase();
+      const format = (fileName.endsWith('.cif') || fileName.endsWith('.bcif')) ? 'mmcif' : 'pdb';
+      const isBinary = fileName.endsWith('.bcif');
+
+      const data = await pluginRef.current.builders.data.rawData({ 
+        data: isBinary ? binaryData : new TextDecoder().decode(binaryData), 
+        label: file.name 
+      });
+
+      const traj = await pluginRef.current.builders.structure.parseTrajectory(data, format);
+      await pluginRef.current.builders.structure.hierarchy.applyPreset(traj, 'default');
+
+      setCurrentId(file.name);
+      setTimeout(syncVisuals, 200);
+    } catch (err) {
+      console.error("File Parse Error:", err);
+      setErrorDetails("文件解析失败: 请确保文件是标准 PDB 或 CIF 格式");
+    } finally {
+      setIsBusy(false);
     }
   };
 
-  // --- AI 逻辑 ---
-  const handleAiChat = async (e) => {
-    e.preventDefault();
-    if (!chatInput.trim() || !GEMINI_API_KEY) {
-        if (!GEMINI_API_KEY) setAiHistory(p => [...p, {role:'system', text:'请在代码顶部填入 API Key 即可激活 AI 对话。'}]);
-        return;
-    }
-    const msg = chatInput;
-    setChatInput("");
-    setAiHistory(p => [...p, {role:'user', text: msg}]);
-    setIsAiThinking(true);
-
-    try {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ contents: [{ parts: [{ text: `You are a bio-assistant. User asks: ${msg}. If they want to change style to surface/cartoon/etc, answer in JSON: {"style": "surface"}. Else just text.` }] }] })
-        });
-        const data = await res.json();
-        const text = data.candidates[0].content.parts[0].text;
-        try {
-            const json = JSON.parse(text.replace(/```json/g, '').replace(/```/g, ''));
-            if (json.style) setStyle(json.style);
-            setAiHistory(p => [...p, {role:'system', text: "已为您切换样式。"}]);
-        } catch {
-            setAiHistory(p => [...p, {role:'system', text: text}]);
-        }
-    } catch (e) {
-        setAiHistory(p => [...p, {role:'system', text: "AI 暂时掉线..."}]);
-    } finally {
-        setIsAiThinking(false);
+  // --- 下载功能 ---
+  const downloadSnapshot = () => {
+    if (pluginRef.current) {
+      pluginRef.current.canvas3d.requestScreenshot();
     }
   };
 
   return (
-    <div className="flex flex-col h-screen w-full bg-slate-900 text-white font-sans overflow-hidden">
+    <div className="flex flex-col h-screen w-full bg-[#0a0a0f] text-slate-200 font-sans overflow-hidden">
       
-      {/* 顶部导航 */}
-      <header className="h-14 flex items-center justify-between px-6 bg-slate-950 border-b border-white/10 z-50">
+      {/* 顶部导航：数据输入 */}
+      <header className="h-16 flex items-center justify-between px-6 bg-slate-950/80 border-b border-white/5 backdrop-blur-md z-50">
         <div className="flex items-center gap-3">
-          <div className="p-1.5 bg-indigo-600 rounded">
-            <Cpu size={18} />
+          <div className="p-2 bg-indigo-600 rounded-lg shadow-lg shadow-indigo-500/20">
+            <Box className="text-white" size={20} />
           </div>
-          <span className="font-bold tracking-tight text-sm">BIOLENS <span className="text-indigo-500">PRO</span></span>
+          <div>
+            <h1 className="text-sm font-black tracking-widest text-white">BIOLENS <span className="text-indigo-500">ENGINE</span></h1>
+            <p className="text-[9px] text-slate-500 font-mono uppercase tracking-tighter">Molecular Analysis System v4.0</p>
+          </div>
         </div>
 
-        <div className="flex items-center gap-3">
-          <div className="flex items-center bg-slate-800 rounded-md px-2 border border-white/5">
+        <div className="flex items-center gap-3 bg-slate-900/50 p-1.5 rounded-xl border border-white/5">
+          <div className="flex items-center px-3 gap-2">
             <Search size={14} className="text-slate-500" />
             <input 
-              className="bg-transparent border-none outline-none px-2 py-1 text-xs w-24 uppercase font-mono"
-              placeholder="PDB ID"
-              value={pdbInput}
-              onChange={e => setPdbInput(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && loadByPdbId(pdbInput)}
+              className="bg-transparent border-none outline-none text-xs w-24 font-mono uppercase placeholder:text-slate-700"
+              placeholder="PDB ID..."
+              value={searchPdb}
+              onChange={e => setSearchPdb(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleFetchPdb(searchPdb)}
             />
           </div>
-          <button onClick={() => loadByPdbId(pdbInput)} className="bg-indigo-600 hover:bg-indigo-500 text-[10px] font-bold px-3 py-1.5 rounded transition-all">FETCH</button>
+          <button 
+            onClick={() => handleFetchPdb(searchPdb)}
+            className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-[10px] font-bold transition-all active:scale-95"
+          >
+            LOAD
+          </button>
           
-          <div className="h-4 w-px bg-white/10 mx-1" />
-          
-          <label className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded text-[10px] font-bold cursor-pointer transition-all border border-white/10">
-            <Upload size={14} /> UPLOAD
-            <input type="file" onChange={handleFileUpload} className="hidden" accept=".pdb,.cif" />
+          <div className="w-px h-4 bg-white/10" />
+
+          <label className="flex items-center gap-2 px-4 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-lg text-[10px] font-bold cursor-pointer transition-all border border-white/5">
+            <Upload size={14} className="text-indigo-400" /> UPLOAD
+            <input type="file" onChange={handleLocalFile} className="hidden" accept=".pdb,.cif,.bcif" />
           </label>
         </div>
+
+        <button onClick={downloadSnapshot} className="p-2 hover:bg-white/5 rounded-full transition-colors text-slate-400">
+          <Download size={18} />
+        </button>
       </header>
 
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 overflow-hidden relative">
         
-        {/* 3D 视口 */}
-        <main className="flex-1 relative bg-[#050505]">
-          {loading && (
-            <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-slate-950/60 backdrop-blur-sm">
-              <RefreshCw className="w-8 h-8 text-indigo-500 animate-spin mb-2" />
-              <p className="text-[10px] font-mono text-indigo-300">ENGINE PROCESSING...</p>
+        {/* Mol* 渲染主视口 */}
+        <main className="flex-1 relative bg-black">
+          {isBusy && (
+            <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-black/40 backdrop-blur-[2px]">
+              <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin mb-3" />
+              <span className="text-[10px] font-mono tracking-[0.2em] text-indigo-400 animate-pulse">SYNCHRONIZING ENGINE...</span>
             </div>
           )}
 
-          {error && (
-            <div className="absolute top-5 left-1/2 -translate-x-1/2 z-50 bg-red-600 text-white px-4 py-2 rounded-md text-xs flex items-center gap-2 shadow-xl">
-              <AlertCircle size={14} /> {error}
-              <button onClick={() => setError(null)} className="ml-2 font-bold">✕</button>
+          {errorDetails && (
+            <div className="absolute top-6 left-1/2 -translate-x-1/2 z-50 bg-red-500/10 border border-red-500/50 backdrop-blur-xl text-red-200 px-6 py-3 rounded-2xl flex items-center gap-3 shadow-2xl">
+              <AlertCircle size={16} />
+              <span className="text-xs font-bold">{errorDetails}</span>
+              <button onClick={() => setErrorDetails(null)} className="ml-4 opacity-50 hover:opacity-100">✕</button>
             </div>
           )}
           
           <div ref={containerRef} className="w-full h-full" />
-
-          {/* AI 对话框 */}
-          <div className="absolute bottom-6 left-6 z-40 w-72">
-            <div className="bg-slate-950/90 border border-white/10 rounded-xl shadow-2xl flex flex-col max-h-[300px]">
-              <div className="p-2.5 border-b border-white/5 flex items-center gap-2">
-                <Sparkles size={14} className="text-indigo-400" />
-                <span className="text-[10px] font-bold text-slate-400">BIOLENS AI</span>
-              </div>
-              <div className="flex-1 overflow-y-auto p-3 space-y-3 custom-scrollbar text-[10px]">
-                {aiHistory.map((m, i) => (
-                  <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`max-w-[90%] px-2.5 py-1.5 rounded-lg ${m.role === 'user' ? 'bg-indigo-600' : 'bg-slate-800 text-slate-300'}`}>
-                      {m.text}
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <form onSubmit={handleAiChat} className="p-2 bg-white/5">
-                <input 
-                  className="w-full bg-slate-900 border border-white/10 rounded-md py-1.5 px-3 text-[10px] outline-none focus:border-indigo-500"
-                  placeholder="Ask AI..."
-                  value={chatInput}
-                  onChange={e => setChatInput(e.target.value)}
-                />
-              </form>
-            </div>
-          </div>
         </main>
 
-        {/* 右侧交互面板 */}
-        <aside className="w-64 bg-slate-950 border-l border-white/10 p-5 flex flex-col gap-6 z-40 shadow-2xl">
+        {/* 右侧交互控制台：核心功能区 */}
+        <aside className="w-72 bg-slate-950 border-l border-white/5 p-6 flex flex-col gap-8 z-40 shadow-[-20px_0_40px_rgba(0,0,0,0.8)] overflow-y-auto custom-scrollbar">
           
-          <div>
-            <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2">
-              <Layers size={14} /> Drawing Style
-            </h3>
-            <div className="grid grid-cols-2 gap-1.5">
-              {['cartoon', 'surface', 'ball-and-stick', 'spacefill', 'line'].map(s => (
+          {/* 状态指示 */}
+          <div className="p-4 bg-indigo-500/5 border border-indigo-500/20 rounded-2xl">
+            <span className="text-[9px] font-bold text-indigo-500 uppercase tracking-widest">Active Structure</span>
+            <h2 className="text-sm font-mono text-indigo-100 mt-1 truncate">{currentId}</h2>
+          </div>
+
+          {/* 渲染样式交互 */}
+          <section>
+            <div className="flex items-center gap-2 mb-4">
+              <Layers size={14} className="text-slate-500" />
+              <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">Geometry</h3>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                {id: 'cartoon', label: 'Cartoon'},
+                {id: 'molecular-surface', label: 'Surface'},
+                {id: 'ball-and-stick', label: 'B & S'},
+                {id: 'spacefill', label: 'Sphere'},
+              ].map(item => (
                 <button 
-                  key={s}
-                  onClick={() => setStyle(s)}
-                  className={`py-2 rounded text-[9px] font-bold border transition-all uppercase
-                  ${style === s ? 'bg-indigo-600 border-indigo-400' : 'bg-slate-900 border-white/5 text-slate-500 hover:bg-slate-800'}`}
+                  key={item.id}
+                  onClick={() => setReprStyle(item.id)}
+                  className={`py-3 rounded-xl text-[10px] font-bold transition-all border
+                  ${reprStyle === item.id 
+                    ? 'bg-indigo-600 border-indigo-400 text-white shadow-lg shadow-indigo-600/30 active:scale-95' 
+                    : 'bg-slate-900 border-white/5 text-slate-500 hover:border-white/10 hover:bg-slate-800'}`}
                 >
-                  {s.replace('-and-', '&')}
+                  {item.label}
                 </button>
               ))}
             </div>
-          </div>
+          </section>
 
-          <div>
-            <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2">
-              <Palette size={14} /> Color Scheme
-            </h3>
-            <select 
-              className="w-full bg-slate-900 border border-white/10 rounded-md p-2 text-[10px] text-slate-300 outline-none mb-2"
-              value={colorScheme}
-              onChange={e => setColorScheme(e.target.value)}
-            >
-              <option value="chain-id">By Chain</option>
-              <option value="element-symbol">By Element</option>
-              <option value="hydrophobicity">By Hydrophobicity</option>
-              <option value="uniform">Uniform Color</option>
-            </select>
+          {/* 着色系统交互 */}
+          <section>
+            <div className="flex items-center gap-2 mb-4">
+              <Palette size={14} className="text-slate-500" />
+              <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">Coloring</h3>
+            </div>
+            <div className="space-y-3">
+              <select 
+                className="w-full bg-slate-900 border border-white/10 rounded-xl p-3 text-xs text-slate-300 outline-none focus:ring-1 focus:ring-indigo-500"
+                value={colorTheme}
+                onChange={e => setColorTheme(e.target.value)}
+              >
+                <option value="chain-id">By Chain ID</option>
+                <option value="element-symbol">By Element (CPK)</option>
+                <option value="residue-name">By Residue</option>
+                <option value="hydrophobicity">By Hydrophobicity</option>
+                <option value="uniform">Custom Uniform</option>
+              </select>
 
-            {colorScheme === 'uniform' && (
-              <div className="flex items-center gap-2 p-2 bg-slate-900 rounded border border-white/5">
-                <input type="color" value={uniformColor} onChange={e => setUniformColor(e.target.value)} className="w-6 h-6 bg-transparent" />
-                <span className="text-[10px] font-mono text-slate-500">{uniformColor}</span>
-              </div>
-            )}
-          </div>
+              {colorTheme === 'uniform' && (
+                <div className="flex items-center justify-between p-3 bg-slate-900 rounded-xl border border-white/5">
+                  <span className="text-[10px] font-bold text-slate-500 uppercase">Tint Color</span>
+                  <input 
+                    type="color" 
+                    value={hexColor} 
+                    onChange={e => setHexColor(e.target.value)}
+                    className="w-8 h-8 bg-transparent border-none cursor-pointer"
+                  />
+                </div>
+              )}
+            </div>
+          </section>
 
-          <div>
-            <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2">
-              <Activity size={14} /> Show/Hide
-            </h3>
+          {/* 子系统开关交互 */}
+          <section>
+            <div className="flex items-center gap-2 mb-4">
+              <Activity size={14} className="text-slate-500" />
+              <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">Sub-systems</h3>
+            </div>
             <div className="space-y-2">
-              <button onClick={() => setShowWater(!showWater)} className={`w-full flex justify-between p-2 rounded text-[10px] border transition-all ${showWater ? 'bg-blue-900/20 border-blue-500/50 text-blue-400' : 'bg-slate-900 border-transparent opacity-40'}`}>
-                WATER (HOH) <span>{showWater ? 'ON' : 'OFF'}</span>
-              </button>
-              <button onClick={() => setShowLigands(!showLigands)} className={`w-full flex justify-between p-2 rounded text-[10px] border transition-all ${showLigands ? 'bg-emerald-900/20 border-emerald-500/50 text-emerald-400' : 'bg-slate-900 border-transparent opacity-40'}`}>
-                LIGANDS <span>{showLigands ? 'ON' : 'OFF'}</span>
-              </button>
+              <ToggleButton 
+                icon={<Droplet size={12}/>} 
+                label="Solvent (H2O)" 
+                active={showWater} 
+                onClick={() => setShowWater(!showWater)} 
+              />
+              <ToggleButton 
+                icon={<Eye size={12}/>} 
+                label="Hetero Atoms" 
+                active={showHetero} 
+                onClick={() => setShowHetero(!showHetero)} 
+              />
             </div>
-          </div>
+          </section>
 
-          <div className="mt-auto space-y-2">
-            <div className="p-3 bg-indigo-900/10 border border-indigo-500/20 rounded-lg">
-                <p className="text-[9px] text-slate-500 uppercase font-bold mb-1">Active Model</p>
-                <p className="text-[11px] font-mono text-indigo-400 truncate">{activeId}</p>
-            </div>
-            <button onClick={() => pluginRef.current?.managers.camera.reset()} className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 rounded text-[9px] font-bold transition-all border border-white/5 flex items-center justify-center gap-2">
-              <RefreshCw size={12} /> RESET VIEWPORT
+          <div className="mt-auto">
+             <button 
+              onClick={() => pluginRef.current?.managers.camera.reset()}
+              className="w-full py-4 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-2xl text-[10px] font-black tracking-widest transition-all border border-white/5 flex items-center justify-center gap-2"
+            >
+              <RefreshCw size={14} /> RESET VIEWPORT
             </button>
           </div>
 
@@ -362,4 +377,20 @@ const BioLensV3 = () => {
   );
 };
 
-export default BioLensV3;
+// 辅助组件：交互开关
+const ToggleButton = ({ label, active, onClick, icon }) => (
+  <button 
+    onClick={onClick}
+    className={`w-full flex items-center justify-between p-3.5 rounded-2xl border transition-all ${
+      active ? 'bg-indigo-500/10 border-indigo-500/50 text-indigo-400' : 'bg-slate-900 border-white/5 text-slate-600 opacity-60'
+    }`}
+  >
+    <div className="flex items-center gap-3">
+      {icon}
+      <span className="text-[10px] font-bold uppercase">{label}</span>
+    </div>
+    <div className={`w-1.5 h-1.5 rounded-full ${active ? 'bg-indigo-400 shadow-[0_0_8px_rgba(129,140,248,0.8)]' : 'bg-slate-700'}`} />
+  </button>
+);
+
+export default BioLensFinal;
